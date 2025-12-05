@@ -1,0 +1,21 @@
+# Build and CMake
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# IDA SDK checkout
+ida-sdk/
+
+# Artifacts and releases
+artifacts/
+release/
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
