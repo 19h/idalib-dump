@@ -69,6 +69,7 @@ struct Options {
     bool show_summary = true;        // Show summary at end
     bool list_functions = false;     // Just list function names
     bool verbose = false;            // Show extra metadata
+    bool no_plugins = false;         // Disable loading user plugins
 };
 
 static Options g_opts;
@@ -669,6 +670,11 @@ static void print_summary() {
 class HeadlessIdaContext {
 public:
     HeadlessIdaContext(const char *input_file) {
+        // Disable user plugins by pointing IDAUSR to a non-existent directory
+        if (g_opts.no_plugins) {
+            qsetenv("IDAUSR", "/dev/null");
+        }
+
         if (init_library() != 0) {
             throw std::runtime_error("Failed to initialize IDA library.");
         }
@@ -730,6 +736,7 @@ static void print_usage(const char* prog) {
     std::cout << "  --pseudo-only            Show only pseudocode\n";
     std::cout << "  --no-color               Disable colored output\n";
     std::cout << "  --no-summary             Don't show summary at end\n";
+    std::cout << "  --no-plugins             Don't load user plugins\n";
     std::cout << "  -h, --help               Show this help\n";
     std::cout << "\n";
     std::cout << CLR(Cyan) << "Examples:" << CLR(Reset) << "\n";
@@ -822,6 +829,9 @@ static bool parse_args(int argc, char* argv[]) {
         }
         else if (arg == "--no-summary") {
             g_opts.show_summary = false;
+        }
+        else if (arg == "--no-plugins") {
+            g_opts.no_plugins = true;
         }
         else if (arg[0] == '-') {
             std::cerr << "Unknown option: " << arg << "\n";
