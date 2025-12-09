@@ -59,3 +59,29 @@ ida_add_idalib(ida_lumina
 target_compile_features(ida_lumina PRIVATE cxx_std_17)
 target_link_libraries(ida_lumina PRIVATE dl)
 
+# Telegram Lumina Bot (optional, requires TDLib)
+option(BUILD_LUMINA_BOT "Build the Telegram Lumina bot (requires TDLib)" OFF)
+
+if(BUILD_LUMINA_BOT)
+    find_package(Td QUIET)
+    if(Td_FOUND)
+        message(STATUS "TDLib found, building lumina_bot")
+
+        ida_add_idalib(lumina_bot
+          TYPE EXECUTABLE
+          SOURCES
+            src/lumina_bot.cpp
+            src/noplugins.c
+          INCLUDES
+            ${CMAKE_CURRENT_LIST_DIR}/vendor/kat/include
+        )
+
+        target_compile_features(lumina_bot PRIVATE cxx_std_17)
+        target_link_libraries(lumina_bot PRIVATE Td::TdStatic dl pthread)
+    else()
+        message(WARNING "TDLib not found. Install TDLib to build lumina_bot.")
+        message(STATUS "  TDLib: https://github.com/tdlib/td")
+        message(STATUS "  Build with: cmake -DBUILD_LUMINA_BOT=ON -DTd_DIR=/path/to/td/lib/cmake/Td")
+    endif()
+endif()
+
