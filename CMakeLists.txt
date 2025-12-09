@@ -20,6 +20,7 @@ ida_add_idalib(ida_dump
   TYPE EXECUTABLE
   SOURCES
     src/main.cpp
+    src/noplugins.c
     vendor/kat/highlight.c
     vendor/kat/hashtable.c
     vendor/astyle/src/ASBeautifier.cpp
@@ -35,3 +36,26 @@ ida_add_idalib(ida_dump
 
 target_compile_definitions(ida_dump PRIVATE ASTYLE_LIB ASTYLE_NO_EXPORT)
 target_compile_features(ida_dump PRIVATE cxx_std_17)
+
+# Generate debug info
+if(MSVC)
+    add_compile_options(/Zi)
+    add_link_options(/DEBUG /OPT:REF /OPT:ICF)
+else()
+    # For GCC/Clang on Linux/Unix
+    add_compile_options(-g)
+endif()
+
+# Lumina push tool
+ida_add_idalib(ida_lumina
+  TYPE EXECUTABLE
+  SOURCES
+    src/lumina.cpp
+    src/noplugins.c
+  INCLUDES
+    ${CMAKE_CURRENT_LIST_DIR}/vendor/kat/include
+)
+
+target_compile_features(ida_lumina PRIVATE cxx_std_17)
+target_link_libraries(ida_lumina PRIVATE dl)
+

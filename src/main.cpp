@@ -25,6 +25,28 @@
 #include <cstdlib>
 #include <new>
 
+// Save real setenv/getenv before IDA SDK redefines them with macros
+static inline int real_setenv(const char* name, const char* value) {
+#ifdef _WIN32
+    return _putenv_s(name, value);
+#else
+    return setenv(name, value, 1);
+#endif
+}
+
+static inline const char* real_getenv(const char* name) {
+    return getenv(name);
+}
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#include <dirent.h>
+#endif
+
+// From noplugins.c - controls plugin blocking
+extern "C" bool g_block_plugins;
+
 extern "C" {
 #include "highlight.h"
 }
@@ -670,9 +692,66 @@ static void print_summary() {
 class HeadlessIdaContext {
 public:
     HeadlessIdaContext(const char *input_file) {
-        // Disable user plugins by pointing IDAUSR to a non-existent directory
+        // Disable plugins by creating a fake IDADIR with empty plugins folder
         if (g_opts.no_plugins) {
-            qsetenv("IDAUSR", "/dev/null");
+            g_block_plugins = true;
+
+            const char* idadir = real_getenv("IDADIR");
+            const char* home = real_getenv("HOME");
+
+            if (idadir && home) {
+                std::string real_idadir = idadir;
+                std::string fake_base = "/tmp/.ida_no_plugins_" + std::to_string(getpid());
+                std::string fake_idadir = fake_base + "/ida";
+                std::string fake_plugins = fake_idadir + "/plugins";
+
+                // Create fake IDA directory structure
+                mkdir(fake_base.c_str(), 0755);
+                mkdir(fake_idadir.c_str(), 0755);
+                mkdir(fake_plugins.c_str(), 0755);  // Plugins dir with only hexrays
+
+                // Symlink hexrays decompiler plugins
+                std::string real_plugins = real_idadir + "/plugins";
+                DIR* pdir = opendir(real_plugins.c_str());
+                if (pdir) {
+                    struct dirent* pentry;
+                    while ((pentry = readdir(pdir)) != NULL) {
+                        // Only symlink hex* files (hexrays decompilers)
+                        if (strncmp(pentry->d_name, "hex", 3) == 0) {
+                            std::string src = real_plugins + "/" + pentry->d_name;
+                            std::string dst = fake_plugins + "/" + pentry->d_name;
+                            symlink(src.c_str(), dst.c_str());
+                        }
+                    }
+                    closedir(pdir);
+                }
+
+                // Symlink all entries from real IDADIR except plugins
+                DIR* dir = opendir(real_idadir.c_str());
+                if (dir) {
+                    struct dirent* entry;
+                    while ((entry = readdir(dir)) != NULL) {
+                        if (strcmp(entry->d_name, ".") == 0 ||
+                            strcmp(entry->d_name, "..") == 0 ||
+                            strcmp(entry->d_name, "plugins") == 0) {
+                            continue;
+                        }
+                        std::string src = real_idadir + "/" + entry->d_name;
+                        std::string dst = fake_idadir + "/" + entry->d_name;
+                        symlink(src.c_str(), dst.c_str());
+                    }
+                    closedir(dir);
+                }
+
+                real_setenv("IDADIR", fake_idadir.c_str());
+
+                // Also redirect IDAUSR
+                std::string real_idausr = std::string(home) + "/.idapro";
+                std::string fake_idausr = fake_base + "/user";
+                mkdir(fake_idausr.c_str(), 0755);
+                symlink((real_idausr + "/ida.reg").c_str(), (fake_idausr + "/ida.reg").c_str());
+                real_setenv("IDAUSR", fake_idausr.c_str());
+            }
         }
 
         if (init_library() != 0) {

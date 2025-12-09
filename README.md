@@ -73,7 +73,7 @@ By default, assembly and pseudocode are shown. Use these flags to customize:
 | `--no-format-pseudo` | Disable AStyle formatting of pseudocode |
 | `--no-color` | Disable ANSI color output |
 | `--no-summary` | Don't show summary statistics |
-| `--no-plugins` | Don't load user plugins |
+| `--no-plugins` | Don't load plugins (except Hex-Rays decompiler) |
 
 ## Examples
 
