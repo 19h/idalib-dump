@@ -52,7 +52,26 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake
+          sudo apt-get install -y build-essential cmake gperf libssl-dev zlib1g-dev
+
+      - name: Cache TDLib (Linux)
+        if: runner.os == 'Linux'
+        id: cache-tdlib
+        uses: actions/cache@v4
+        with:
+          path: tdlib-install
+          key: tdlib-master-${{ runner.os }}
+
+      - name: Build TDLib (Linux)
+        if: runner.os == 'Linux' && steps.cache-tdlib.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch master https://github.com/tdlib/td.git
+          cd td
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/tdlib-install
+          cmake --build . --target install -j$(nproc)
 
       - name: Configure CMake (macOS)
         if: runner.os == 'macOS'
@@ -73,7 +92,9 @@ jobs:
           cd build
           cmake .. \
             -DCMAKE_BUILD_TYPE=Release \
-            -DIDASDK_VER=92
+            -DIDASDK_VER=92 \
+            -DBUILD_LUMINA_BOT=ON \
+            -DTd_DIR=${{ github.workspace }}/tdlib-install/lib/cmake/Td
         env:
           IDASDK: ${{ github.workspace }}/ida-sdk
 
@@ -98,56 +119,50 @@ jobs:
           cd build
           cmake --build . --config Release
 
-      - name: Find built binary (Unix)
-        if: runner.os != 'Windows'
-        id: find_binary_unix
-        run: |
-          BIN_FILE=$(find . -type f -name "ida_dump" -perm -111 | head -1)
-          if [ -z "$BIN_FILE" ]; then
-            echo "ERROR: Could not find built ida_dump"
-            find . -type f -name "ida_dump*"
-            exit 1
-          fi
-          echo "binary_file=$BIN_FILE" >> $GITHUB_OUTPUT
-          echo "extension=" >> $GITHUB_OUTPUT
-          echo "Found binary: $BIN_FILE"
-
-      - name: Find built binary (Windows)
-        if: runner.os == 'Windows'
-        id: find_binary_windows
-        shell: pwsh
-        run: |
-          $bin = Get-ChildItem -Path . -Recurse -Filter "ida_dump.exe" | Select-Object -First 1
-          if ($null -eq $bin) {
-            Write-Error "Could not find built ida_dump.exe"
-            Get-ChildItem -Path . -Recurse -Filter "ida_dump*"
-            exit 1
-          }
-          echo "binary_file=$($bin.FullName)" >> $env:GITHUB_OUTPUT
-          echo "extension=exe" >> $env:GITHUB_OUTPUT
-          Write-Host "Found binary: $($bin.FullName)"
-
-      - name: Prepare artifact (Unix)
+      - name: Prepare artifacts (Unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p artifacts
-          dest="artifacts/ida_dump_${{ matrix.name }}"
-          cp "${{ steps.find_binary_unix.outputs.binary_file }}" "$dest"
-          echo "Copied to $dest"
+          # Copy ida_dump
+          if [ -f "build/ida_dump" ]; then
+            cp build/ida_dump "artifacts/ida_dump_${{ matrix.name }}"
+            echo "Copied ida_dump"
+          fi
+          # Copy ida_lumina
+          if [ -f "build/ida_lumina" ]; then
+            cp build/ida_lumina "artifacts/ida_lumina_${{ matrix.name }}"
+            echo "Copied ida_lumina"
+          fi
+          # Copy lumina_bot (Linux only)
+          if [ -f "build/lumina_bot" ]; then
+            cp build/lumina_bot "artifacts/lumina_bot_${{ matrix.name }}"
+            echo "Copied lumina_bot"
+          fi
+          ls -la artifacts/
 
-      - name: Prepare artifact (Windows)
+      - name: Prepare artifacts (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-          $dest = "artifacts/ida_dump_${{ matrix.name }}.exe"
-          Copy-Item "${{ steps.find_binary_windows.outputs.binary_file }}" $dest
-          Write-Host "Copied to $dest"
+          # Copy ida_dump
+          $dump = Get-ChildItem -Path build -Recurse -Filter "ida_dump.exe" | Select-Object -First 1
+          if ($dump) {
+            Copy-Item $dump.FullName "artifacts/ida_dump_${{ matrix.name }}.exe"
+            Write-Host "Copied ida_dump.exe"
+          }
+          # Copy ida_lumina
+          $lumina = Get-ChildItem -Path build -Recurse -Filter "ida_lumina.exe" | Select-Object -First 1
+          if ($lumina) {
+            Copy-Item $lumina.FullName "artifacts/ida_lumina_${{ matrix.name }}.exe"
+            Write-Host "Copied ida_lumina.exe"
+          }
+          Get-ChildItem artifacts/
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ida_dump-${{ matrix.name }}
+          name: idalib-tools-${{ matrix.name }}
           path: artifacts/
           retention-days: 30
 

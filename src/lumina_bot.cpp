@@ -61,7 +61,10 @@ namespace std_cv {
     }
 }
 
-#ifndef _WIN32
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -145,7 +148,11 @@ private:
     void* m_connection = nullptr;
     void* m_vtable = nullptr;
     GetServerConnection2Fn m_get_server_connection2 = nullptr;
+#ifdef _WIN32
+    HMODULE m_libida = nullptr;
+#else
     void* m_libida = nullptr;
+#endif
 
     void* get_push_metadata_method() {
         if (!m_vtable) return nullptr;
@@ -155,6 +162,20 @@ private:
 
 public:
     LuminaConnection() {
+#ifdef _WIN32
+        m_libida = GetModuleHandleA("ida.dll");
+        if (!m_libida) {
+            m_libida = GetModuleHandleA(nullptr);
+        }
+
+        if (!m_libida) {
+            throw std::runtime_error("Failed to get ida.dll handle");
+        }
+
+        m_get_server_connection2 = reinterpret_cast<GetServerConnection2Fn>(
+            GetProcAddress(m_libida, "get_server_connection2")
+        );
+#else
         m_libida = dlopen("libida.so", RTLD_NOW | RTLD_NOLOAD);
         if (!m_libida) {
             m_libida = dlopen(nullptr, RTLD_NOW);
@@ -167,6 +188,7 @@ public:
         m_get_server_connection2 = reinterpret_cast<GetServerConnection2Fn>(
             dlsym(m_libida, "get_server_connection2")
         );
+#endif
 
         if (!m_get_server_connection2) {
             throw std::runtime_error("Failed to find get_server_connection2");
@@ -626,6 +648,7 @@ private:
         if (g_config.no_plugins) {
             g_block_plugins = true;
 
+#ifndef _WIN32
             const char* idadir = real_getenv("IDADIR");
             const char* home = real_getenv("HOME");
 
@@ -671,6 +694,7 @@ private:
                 }
                 real_setenv("IDAUSR", fake_idausr.c_str());
             }
+#endif
         }
     }
 
