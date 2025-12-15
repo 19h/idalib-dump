@@ -13,6 +13,7 @@
  */
 
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -23,9 +24,13 @@
 #include <algorithm>
 #include <regex>
 #include <cstdlib>
+#include <cstdarg>
 #include <new>
+#include <filesystem>
+#include <chrono>
+#include <iomanip>
 
-// Save real setenv/getenv before IDA SDK redefines them with macros
+// Save real setenv/getenv and FILE* pointers before IDA SDK redefines them with macros
 static inline int real_setenv(const char* name, const char* value) {
 #ifdef _WIN32
     return _putenv_s(name, value);
@@ -38,10 +43,34 @@ static inline const char* real_getenv(const char* name) {
     return getenv(name);
 }
 
-#ifndef _WIN32
+// Save real stdout/stderr and functions before IDA redefines them
+static FILE* real_stdout = stdout;
+static FILE* real_stderr = stderr;
+static inline int real_fflush(FILE* stream) { return fflush(stream); }
+static inline int real_fprintf(FILE* stream, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    int ret = vfprintf(stream, fmt, args);
+    va_end(args);
+    return ret;
+}
+
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#include <process.h>
+#define dup _dup
+#define dup2 _dup2
+#define close _close
+#define open _open
+#define STDOUT_FILENO 1
+#define STDERR_FILENO 2
+#define O_WRONLY _O_WRONLY
+#else
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <fcntl.h>
 #endif
 
 // From noplugins.c - controls plugin blocking
@@ -80,8 +109,10 @@ hexdsp_t *hexdsp = nullptr;
 
 struct Options {
     std::string input_file;
+    std::string output_file;         // Output file (empty = stdout)
     std::string filter_pattern;      // Function name filter (regex)
     ea_t filter_address = BADADDR;   // Filter by specific address
+    std::vector<std::string> function_list;  // Explicit list of functions (names or addresses)
     bool show_assembly = true;
     bool show_microcode = false;
     bool show_pseudocode = true;
@@ -99,13 +130,203 @@ static Options g_opts;
 // Statistics
 struct Stats {
     size_t total_functions = 0;
+    size_t functions_to_process = 0;  // After filtering
+    size_t processed = 0;             // Currently processed
     size_t decompiled_ok = 0;
     size_t decompiled_fail = 0;
     size_t skipped = 0;
+    size_t output_bytes = 0;          // Bytes written to output
     std::vector<std::pair<std::string, std::string>> errors; // (func_name, error)
 };
 
 static Stats g_stats;
+
+// Output stream (stdout or file)
+static std::ostream* g_output = &std::cout;
+static std::unique_ptr<std::ofstream> g_output_file;
+
+//=============================================================================
+// Progress Display
+//=============================================================================
+
+class ProgressDisplay {
+public:
+    ProgressDisplay() : m_start_time(std::chrono::steady_clock::now()) {}
+
+    void set_total(size_t total) {
+        m_total = total;
+    }
+
+    void update(size_t current, const std::string& func_name = "") {
+        if (!should_show()) return;
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_start_time).count();
+
+        // Rate limit updates to avoid flicker (max 20 updates/sec)
+        if (elapsed - m_last_update_ms < 50 && current < m_total) return;
+        m_last_update_ms = elapsed;
+
+        double progress = m_total > 0 ? (double)current / m_total : 0;
+        double elapsed_sec = elapsed / 1000.0;
+        double rate = elapsed_sec > 0 ? current / elapsed_sec : 0;
+
+        // Estimate remaining time
+        std::string eta_str = "---";
+        if (rate > 0 && current < m_total) {
+            double remaining = (m_total - current) / rate;
+            eta_str = format_duration(remaining);
+        }
+
+        // Build progress bar
+        const int bar_width = 30;
+        int filled = (int)(progress * bar_width);
+        std::string bar(filled, '\xe2'); // Will be replaced with proper chars
+
+        // Use block characters for smooth progress
+        std::string bar_filled(filled, '#');
+        std::string bar_empty(bar_width - filled, '-');
+
+        // Truncate function name
+        std::string display_name = func_name;
+        if (display_name.length() > 30) {
+            display_name = display_name.substr(0, 27) + "...";
+        }
+
+        // Format output size
+        std::string size_str = format_bytes(g_stats.output_bytes);
+
+        // Clear line and print progress
+        std::cerr << "\r\033[K";  // Clear line
+        std::cerr << "\033[36m[\033[0m";  // Cyan bracket
+        std::cerr << "\033[32m" << bar_filled << "\033[90m" << bar_empty << "\033[0m";  // Green filled, gray empty
+        std::cerr << "\033[36m]\033[0m ";  // Cyan bracket
+
+        // Percentage
+        std::cerr << "\033[1m" << std::setw(5) << std::fixed << std::setprecision(1)
+                  << (progress * 100) << "%\033[0m ";
+
+        // Stats
+        std::cerr << "\033[90m│\033[0m ";
+        std::cerr << "\033[33m" << current << "\033[90m/\033[33m" << m_total << "\033[0m ";
+        std::cerr << "\033[90m│\033[0m ";
+        std::cerr << "\033[32m" << g_stats.decompiled_ok << "\033[90m ok \033[0m";
+        if (g_stats.decompiled_fail > 0) {
+            std::cerr << "\033[31m" << g_stats.decompiled_fail << "\033[90m err\033[0m ";
+        }
+        std::cerr << "\033[90m│\033[0m ";
+        std::cerr << "\033[35m" << size_str << "\033[0m ";
+        std::cerr << "\033[90m│\033[0m ";
+        std::cerr << "\033[90mETA \033[36m" << eta_str << "\033[0m";
+
+        // Current function (if space)
+        if (!display_name.empty()) {
+            std::cerr << " \033[90m" << display_name << "\033[0m";
+        }
+
+        std::cerr.flush();
+    }
+
+    void finish() {
+        if (!should_show()) return;
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_start_time).count();
+        double elapsed_sec = elapsed / 1000.0;
+
+        // Clear line
+        std::cerr << "\r\033[K";
+
+        // Final summary line
+        std::cerr << "\033[32m✓\033[0m Completed \033[1m" << g_stats.decompiled_ok << "\033[0m functions";
+        if (g_stats.decompiled_fail > 0) {
+            std::cerr << " (\033[31m" << g_stats.decompiled_fail << " errors\033[0m)";
+        }
+        std::cerr << " in \033[36m" << format_duration(elapsed_sec) << "\033[0m";
+        std::cerr << " \033[90m│\033[0m \033[35m" << format_bytes(g_stats.output_bytes) << "\033[0m";
+        if (!g_opts.output_file.empty()) {
+            std::cerr << " \033[90m→\033[0m \033[33m" << g_opts.output_file << "\033[0m";
+        }
+        std::cerr << "\n";
+    }
+
+private:
+    std::chrono::steady_clock::time_point m_start_time;
+    long long m_last_update_ms = 0;
+    size_t m_total = 0;
+
+    bool should_show() const {
+        // Show progress when outputting to file (progress goes to stderr)
+        return !g_opts.output_file.empty();
+    }
+
+    static std::string format_duration(double seconds) {
+        if (seconds < 60) {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(1) << seconds << "s";
+            return oss.str();
+        }
+        int mins = (int)(seconds / 60);
+        int secs = (int)seconds % 60;
+        std::ostringstream oss;
+        oss << mins << "m" << secs << "s";
+        return oss.str();
+    }
+
+    static std::string format_bytes(size_t bytes) {
+        const char* units[] = {"B", "KB", "MB", "GB"};
+        int unit = 0;
+        double size = bytes;
+        while (size >= 1024 && unit < 3) {
+            size /= 1024;
+            unit++;
+        }
+        std::ostringstream oss;
+        if (unit == 0) {
+            oss << bytes << " " << units[unit];
+        } else {
+            oss << std::fixed << std::setprecision(1) << size << " " << units[unit];
+        }
+        return oss.str();
+    }
+};
+
+static ProgressDisplay g_progress;
+
+//=============================================================================
+// Output Helper
+//=============================================================================
+
+// Write to output stream and track bytes written
+class OutputWriter {
+public:
+    template<typename T>
+    OutputWriter& operator<<(const T& val) {
+        if (!g_opts.output_file.empty()) {
+            std::ostringstream oss;
+            oss << val;
+            std::string s = oss.str();
+            g_stats.output_bytes += s.size();
+            *g_output << s;
+        } else {
+            *g_output << val;
+        }
+        return *this;
+    }
+
+    // Handle manipulators like std::endl
+    OutputWriter& operator<<(std::ostream& (*manip)(std::ostream&)) {
+        if (!g_opts.output_file.empty()) {
+            if (manip == static_cast<std::ostream& (*)(std::ostream&)>(std::endl)) {
+                g_stats.output_bytes += 1;  // newline
+            }
+        }
+        *g_output << manip;
+        return *this;
+    }
+};
+
+static OutputWriter out;
 
 //=============================================================================
 // ANSI Colors (for terminal output)
@@ -165,13 +386,78 @@ static bool is_spacer_line(const char *str) {
     return *str == '\0';
 }
 
+// Parse an address string (hex with or without 0x prefix)
+// Only matches pure hex addresses like "0x1234" or "1234ABCD"
+// Does NOT match function names like "sub_14007B090"
+static ea_t parse_address(const std::string& str) {
+    if (str.empty()) return BADADDR;
+
+    const char* s = str.c_str();
+
+    // Skip 0x prefix if present
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        s += 2;
+    }
+    // If it starts with "sub_" or similar prefix, it's a function name, not an address
+    else if (strncmp(str.c_str(), "sub_", 4) == 0 ||
+             strncmp(str.c_str(), "loc_", 4) == 0 ||
+             strncmp(str.c_str(), "unk_", 4) == 0 ||
+             strncmp(str.c_str(), "off_", 4) == 0 ||
+             strncmp(str.c_str(), "byte_", 5) == 0 ||
+             strncmp(str.c_str(), "word_", 5) == 0 ||
+             strncmp(str.c_str(), "dword_", 6) == 0 ||
+             strncmp(str.c_str(), "qword_", 6) == 0) {
+        return BADADDR;  // This is a function/label name, not an address
+    }
+
+    // Check if all remaining chars are hex digits
+    bool all_hex = true;
+    for (const char* p = s; *p; ++p) {
+        if (!std::isxdigit((unsigned char)*p)) {
+            all_hex = false;
+            break;
+        }
+    }
+
+    if (all_hex && *s) {
+        return strtoull(str.c_str(), nullptr, 16);
+    }
+    return BADADDR;
+}
+
 static bool matches_filter(const char* func_name, ea_t func_addr) {
     // Address filter takes precedence
     if (g_opts.filter_address != BADADDR) {
         return func_addr == g_opts.filter_address;
     }
 
-    // Name pattern filter
+    // Explicit function list takes precedence over pattern
+    if (!g_opts.function_list.empty()) {
+        for (const auto& item : g_opts.function_list) {
+            // Try as address first
+            ea_t addr = parse_address(item);
+            if (addr != BADADDR) {
+                if (func_addr == addr) return true;
+                // Also check if addr is within the function
+                func_t* pfn = get_func(addr);
+                if (pfn && pfn->start_ea == func_addr) return true;
+                continue;
+            }
+
+            // Try as exact name match
+            if (item == func_name) return true;
+
+            // Try case-insensitive match
+            std::string name_lower(func_name);
+            std::string item_lower(item);
+            std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);
+            std::transform(item_lower.begin(), item_lower.end(), item_lower.begin(), ::tolower);
+            if (name_lower == item_lower) return true;
+        }
+        return false;
+    }
+
+    // Name pattern filter (regex)
     if (!g_opts.filter_pattern.empty()) {
         try {
             std::regex pattern(g_opts.filter_pattern, std::regex::icase);
@@ -449,6 +735,21 @@ public:
         return false;
     }
 
+    // Check if function matches filter (without decompiling) - public for pre-counting
+    static bool should_process(func_t *pfn, const char* fname) {
+        // Check filter first - this is the key optimization
+        if (!matches_filter(fname, pfn->start_ea)) {
+            return false;
+        }
+
+        // Skip special segments entirely - they can't be decompiled
+        if (is_special_segment(pfn)) {
+            return false;
+        }
+
+        return true;
+    }
+
     // Returns true if decompilation succeeded
     static bool dump(func_t *pfn) {
         if (!pfn) return false;
@@ -456,20 +757,13 @@ public:
         qstring fname;
         get_func_name(&fname, pfn->start_ea);
 
-        // Check filter
-        if (!matches_filter(fname.c_str(), pfn->start_ea)) {
+        // Check filter BEFORE decompiling - critical for performance
+        if (!should_process(pfn, fname.c_str())) {
             g_stats.skipped++;
             return true;
         }
 
-        // Skip special segments entirely - they can't be decompiled
-        bool is_special = is_special_segment(pfn);
-        if (is_special) {
-            g_stats.skipped++;
-            return true;
-        }
-
-        // Try decompilation first to check for errors
+        // Now decompile (only for functions that pass the filter)
         hexrays_failure_t hf;
         cfuncptr_t cfunc = decompile(pfn, &hf, DECOMP_WARNINGS);
 
@@ -501,9 +795,9 @@ public:
             g_stats.decompiled_fail++;
             g_stats.errors.push_back({fname.c_str(), err_msg});
 
-            std::cout << CLR(Red) << "  [ERROR] " << CLR(Reset)
-                      << "Decompilation failed at " << format_address(hf.errea)
-                      << ": " << err_msg << "\n\n";
+            out << CLR(Red) << "  [ERROR] " << CLR(Reset)
+                << "Decompilation failed at " << format_address(hf.errea)
+                << ": " << err_msg << "\n\n";
 
             // Still show assembly if requested
             if (g_opts.show_assembly) {
@@ -545,31 +839,32 @@ public:
 
 private:
     static void print_header(func_t *pfn, const char* fname, bool success) {
+
         // Get segment name
         qstring seg_name;
         segment_t* seg = getseg(pfn->start_ea);
         if (seg) get_segm_name(&seg_name, seg);
 
-        std::cout << "\n";
-        std::cout << CLR(Bold) << std::string(78, '=') << CLR(Reset) << "\n";
+        out << "\n";
+        out << CLR(Bold) << std::string(78, '=') << CLR(Reset) << "\n";
 
         // Function name with status indicator
         const char* status_color = success ? CLR(Green) : CLR(Red);
         const char* status_icon = success ? "[OK]" : "[FAIL]";
 
-        std::cout << CLR(Bold) << "Function: " << CLR(Cyan) << fname << CLR(Reset);
+        out << CLR(Bold) << "Function: " << CLR(Cyan) << fname << CLR(Reset);
         if (!seg_name.empty()) {
-            std::cout << " " << CLR(Dim) << "(" << seg_name.c_str() << ":"
-                      << format_address(pfn->start_ea) << ")" << CLR(Reset);
+            out << " " << CLR(Dim) << "(" << seg_name.c_str() << ":"
+                << format_address(pfn->start_ea) << ")" << CLR(Reset);
         }
-        std::cout << "  " << status_color << status_icon << CLR(Reset) << "\n";
+        out << "  " << status_color << status_icon << CLR(Reset) << "\n";
 
         // Function metadata
         if (g_opts.verbose) {
-            std::cout << CLR(Dim);
-            std::cout << "  Size: " << (pfn->end_ea - pfn->start_ea) << " bytes";
-            std::cout << "  | Range: " << format_address(pfn->start_ea)
-                      << " - " << format_address(pfn->end_ea);
+            out << CLR(Dim);
+            out << "  Size: " << (pfn->end_ea - pfn->start_ea) << " bytes";
+            out << "  | Range: " << format_address(pfn->start_ea)
+                << " - " << format_address(pfn->end_ea);
 
             // Flags
             std::vector<std::string> flag_names;
@@ -579,20 +874,20 @@ private:
             if (pfn->flags & FUNC_FRAME) flag_names.push_back("frame");
 
             if (!flag_names.empty()) {
-                std::cout << "  | Flags: ";
+                out << "  | Flags: ";
                 for (size_t i = 0; i < flag_names.size(); i++) {
-                    if (i > 0) std::cout << ", ";
-                    std::cout << flag_names[i];
+                    if (i > 0) out << ", ";
+                    out << flag_names[i];
                 }
             }
-            std::cout << CLR(Reset) << "\n";
+            out << CLR(Reset) << "\n";
         }
 
-        std::cout << std::string(78, '-') << "\n";
+        out << std::string(78, '-') << "\n";
     }
 
     static void dump_assembly(func_t *pfn) {
-        std::cout << CLR(Yellow) << "-- Assembly " << CLR(Dim) << std::string(65, '-') << CLR(Reset) << "\n";
+        out << CLR(Yellow) << "-- Assembly " << CLR(Dim) << std::string(65, '-') << CLR(Reset) << "\n";
 
         func_item_iterator_t fii;
         for (bool ok = fii.set(pfn); ok; ok = fii.next_code()) {
@@ -601,26 +896,26 @@ private:
 
             if (generate_disasm_line(&line, ea, GENDSM_REMOVE_TAGS | GENDSM_MULTI_LINE | GENDSM_FORCE_CODE)) {
                 line.trim2();
-                std::cout << CLR(Dim) << format_address(ea) << CLR(Reset) << "  " << line.c_str() << "\n";
+                out << CLR(Dim) << format_address(ea) << CLR(Reset) << "  " << line.c_str() << "\n";
             }
         }
-        std::cout << "\n";
+        out << "\n";
     }
 
     static void dump_microcode(cfunc_t *cfunc) {
-        std::cout << CLR(Yellow) << "-- Microcode " << CLR(Dim) << std::string(64, '-') << CLR(Reset) << "\n";
+        out << CLR(Yellow) << "-- Microcode " << CLR(Dim) << std::string(64, '-') << CLR(Reset) << "\n";
 
         if (mba_t *mba = cfunc->mba) {
-            MicrocodePrinter printer(std::cout);
+            MicrocodePrinter printer(*g_output);
             mba->print(printer);
         } else {
-            std::cout << CLR(Dim) << "  (No microcode available)" << CLR(Reset) << "\n";
+            out << CLR(Dim) << "  (No microcode available)" << CLR(Reset) << "\n";
         }
-        std::cout << "\n";
+        out << "\n";
     }
 
     static void dump_pseudocode(cfunc_t *cfunc) {
-        std::cout << CLR(Yellow) << "-- Pseudocode " << CLR(Dim) << std::string(63, '-') << CLR(Reset) << "\n";
+        out << CLR(Yellow) << "-- Pseudocode " << CLR(Dim) << std::string(63, '-') << CLR(Reset) << "\n";
 
         const strvec_t &sv = cfunc->get_pseudocode();
         std::string pseudo_block;
@@ -638,9 +933,14 @@ private:
         std::istringstream stream(formatted);
         std::string line;
         while (std::getline(stream, line)) {
-            std::cout << format_pseudocode_line(qstring(line.c_str())) << "\n";
+            if (!g_opts.output_file.empty()) {
+                // No highlighting for file output
+                out << line << "\n";
+            } else {
+                out << format_pseudocode_line(qstring(line.c_str())) << "\n";
+            }
         }
-        std::cout << "\n";
+        out << "\n";
     }
 };
 
@@ -689,24 +989,73 @@ static void print_summary() {
 // Resource Management
 //=============================================================================
 
+// RAII helper for redirecting stdout/stderr to /dev/null
+class StdioRedirector {
+public:
+    StdioRedirector(bool redirect) : m_active(redirect), m_saved_stdout(-1), m_saved_stderr(-1) {
+        if (!redirect) return;
+        real_fflush(real_stdout);
+        real_fflush(real_stderr);
+        m_saved_stdout = dup(STDOUT_FILENO);
+        m_saved_stderr = dup(STDERR_FILENO);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+    }
+
+    ~StdioRedirector() {
+        restore();
+    }
+
+    void restore() {
+        if (!m_active) return;
+        if (m_saved_stdout >= 0) {
+            real_fflush(real_stdout);
+            dup2(m_saved_stdout, STDOUT_FILENO);
+            close(m_saved_stdout);
+            m_saved_stdout = -1;
+        }
+        if (m_saved_stderr >= 0) {
+            real_fflush(real_stderr);
+            dup2(m_saved_stderr, STDERR_FILENO);
+            close(m_saved_stderr);
+            m_saved_stderr = -1;
+        }
+        m_active = false;
+    }
+
+private:
+    bool m_active;
+    int m_saved_stdout;
+    int m_saved_stderr;
+};
+
 class HeadlessIdaContext {
 public:
     HeadlessIdaContext(const char *input_file) {
+        // In quiet mode, suppress stdout during IDA initialization
+        // Use RAII to ensure restoration even on exceptions
+        StdioRedirector redirector(g_opts.quiet);
+
         // Disable plugins by creating a fake IDADIR with empty plugins folder
         if (g_opts.no_plugins) {
             g_block_plugins = true;
 
+#ifndef _WIN32
             const char* idadir = real_getenv("IDADIR");
             const char* home = real_getenv("HOME");
 
             if (idadir && home) {
                 std::string real_idadir = idadir;
-                std::string fake_base = "/tmp/.ida_no_plugins_" + std::to_string(getpid());
-                std::string fake_idadir = fake_base + "/ida";
+                m_fake_idadir_base = "/tmp/.ida_no_plugins_" + std::to_string(getpid());
+                std::string fake_idadir = m_fake_idadir_base + "/ida";
                 std::string fake_plugins = fake_idadir + "/plugins";
 
                 // Create fake IDA directory structure
-                mkdir(fake_base.c_str(), 0755);
+                mkdir(m_fake_idadir_base.c_str(), 0755);
                 mkdir(fake_idadir.c_str(), 0755);
                 mkdir(fake_plugins.c_str(), 0755);  // Plugins dir with only hexrays
 
@@ -747,11 +1096,12 @@ public:
 
                 // Also redirect IDAUSR
                 std::string real_idausr = std::string(home) + "/.idapro";
-                std::string fake_idausr = fake_base + "/user";
+                std::string fake_idausr = m_fake_idadir_base + "/user";
                 mkdir(fake_idausr.c_str(), 0755);
                 symlink((real_idausr + "/ida.reg").c_str(), (fake_idausr + "/ida.reg").c_str());
                 real_setenv("IDAUSR", fake_idausr.c_str());
             }
+#endif
         }
 
         if (init_library() != 0) {
@@ -777,27 +1127,70 @@ public:
             term_database();
             throw std::runtime_error("Hex-Rays decompiler not available.");
         }
+
+        // Explicitly restore before leaving constructor (RAII destructor would also do it)
+        redirector.restore();
     }
 
     ~HeadlessIdaContext() {
         term_hexrays_plugin();
         set_database_flag(DBFL_KILL);
         term_database();
+
+        // Clean up fake IDADIR if we created one
+        if (!m_fake_idadir_base.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(m_fake_idadir_base, ec);
+        }
     }
 
     HeadlessIdaContext(const HeadlessIdaContext&) = delete;
     HeadlessIdaContext& operator=(const HeadlessIdaContext&) = delete;
+
+private:
+    std::string m_fake_idadir_base;  // Path to clean up on destruction
 };
 
 //=============================================================================
 // Usage
 //=============================================================================
 
+// Split a string by multiple delimiters (comma or pipe)
+static std::vector<std::string> split_string(const std::string& str) {
+    std::vector<std::string> result;
+    std::string item;
+
+    for (char c : str) {
+        if (c == ',' || c == '|') {
+            // Trim whitespace
+            size_t start = item.find_first_not_of(" \t");
+            size_t end = item.find_last_not_of(" \t");
+            if (start != std::string::npos) {
+                result.push_back(item.substr(start, end - start + 1));
+            }
+            item.clear();
+        } else {
+            item += c;
+        }
+    }
+
+    // Don't forget the last item
+    size_t start = item.find_first_not_of(" \t");
+    size_t end = item.find_last_not_of(" \t");
+    if (start != std::string::npos) {
+        result.push_back(item.substr(start, end - start + 1));
+    }
+
+    return result;
+}
+
 static void print_usage(const char* prog) {
     std::cout << CLR(Bold) << "IDA Pro Binary Analysis Dumper" << CLR(Reset) << "\n\n";
     std::cout << CLR(Cyan) << "Usage:" << CLR(Reset) << " " << prog << " [options] <binary_file>\n\n";
     std::cout << CLR(Cyan) << "Options:" << CLR(Reset) << "\n";
+    std::cout << "  -o, --output <file>      Write output to file (shows progress on stderr)\n";
     std::cout << "  -f, --filter <pattern>   Filter functions by name (regex)\n";
+    std::cout << "  -F, --functions <list>   List of functions (comma or pipe separated)\n";
     std::cout << "  -a, --address <addr>     Show only function at address (hex)\n";
     std::cout << "  -e, --errors             Show only functions with decompilation errors\n";
     std::cout << "  -l, --list               List functions only (no decompilation)\n";
@@ -819,13 +1212,12 @@ static void print_usage(const char* prog) {
     std::cout << "  -h, --help               Show this help\n";
     std::cout << "\n";
     std::cout << CLR(Cyan) << "Examples:" << CLR(Reset) << "\n";
-    std::cout << "  " << prog << " program.exe                    # Dump all functions\n";
-    std::cout << "  " << prog << " -f main program.exe            # Only 'main' function\n";
-    std::cout << "  " << prog << " -f 'test_.*' program.exe       # Functions matching regex\n";
-    std::cout << "  " << prog << " -a 0x1234 program.exe          # Function at address\n";
-    std::cout << "  " << prog << " -e program.exe                 # Only show errors\n";
-    std::cout << "  " << prog << " -l program.exe                 # List functions\n";
-    std::cout << "  " << prog << " --pseudo-only -q program.exe   # Quiet, pseudocode only\n";
+    std::cout << "  " << prog << " program.exe                        # Dump all functions\n";
+    std::cout << "  " << prog << " -f main program.exe                # Only 'main' function\n";
+    std::cout << "  " << prog << " -F main,foo,bar program.exe        # Specific functions by name\n";
+    std::cout << "  " << prog << " -o out.c --pseudo-only program.exe # Export to file with progress\n";
+    std::cout << "  " << prog << " -e program.exe                     # Only show errors\n";
+    std::cout << "  " << prog << " -l program.exe                     # List functions\n";
     std::cout << "\n";
 }
 
@@ -841,6 +1233,13 @@ static bool parse_args(int argc, char* argv[]) {
             print_usage(argv[0]);
             exit(0);
         }
+        else if (arg == "-o" || arg == "--output") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --output requires a filename\n";
+                return false;
+            }
+            g_opts.output_file = argv[++i];
+        }
         else if (arg == "-f" || arg == "--filter") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --filter requires an argument\n";
@@ -854,6 +1253,13 @@ static bool parse_args(int argc, char* argv[]) {
                 return false;
             }
             g_opts.filter_address = strtoull(argv[++i], nullptr, 16);
+        }
+        else if (arg == "-F" || arg == "--functions") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --functions requires an argument\n";
+                return false;
+            }
+            g_opts.function_list = split_string(argv[++i]);
         }
         else if (arg == "-e" || arg == "--errors") {
             g_opts.errors_only = true;
@@ -951,13 +1357,31 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    // Set up output file if specified
+    if (!g_opts.output_file.empty()) {
+        g_output_file = std::make_unique<std::ofstream>(g_opts.output_file);
+        if (!g_output_file->is_open()) {
+            std::cerr << "Error: Cannot open output file: " << g_opts.output_file << "\n";
+            return EXIT_FAILURE;
+        }
+        g_output = g_output_file.get();
+        // Disable colors for file output
+        Color::disable();
+        // Auto-enable quiet mode and no-plugins for file output
+        g_opts.quiet = true;
+        g_opts.no_plugins = true;
+    }
+
+    // In file mode, suppress normal console output
+    bool show_console_info = g_opts.output_file.empty() && !g_opts.quiet;
+
     HighlighterGuard highlighter_guard;
 
     try {
         HeadlessIdaContext ctx(g_opts.input_file.c_str());
 
-        // Print binary info unless in quiet mode
-        if (!g_opts.quiet) {
+        // Print binary info unless in quiet/raw/file mode
+        if (show_console_info) {
             print_binary_info();
             if (g_opts.verbose) {
                 print_segments();
@@ -966,7 +1390,40 @@ int main(int argc, char *argv[]) {
 
         g_stats.total_functions = get_func_qty();
 
-        if (!g_opts.quiet) {
+        // Count functions to process (for progress display)
+        if (!g_opts.output_file.empty()) {
+            size_t count = 0;
+            for (size_t i = 0; i < g_stats.total_functions; ++i) {
+                func_t *pfn = getn_func(i);
+                if (pfn) {
+                    qstring fname;
+                    get_func_name(&fname, pfn->start_ea);
+                    if (FunctionDumper::should_process(pfn, fname.c_str())) {
+                        count++;
+                    }
+                }
+            }
+            g_stats.functions_to_process = count;
+            g_progress.set_total(count);
+
+            // Warn if no functions matched the filter
+            if (count == 0 && (!g_opts.function_list.empty() || !g_opts.filter_pattern.empty() || g_opts.filter_address != BADADDR)) {
+                std::cerr << "\033[33mWarning: No functions matched the filter.\033[0m\n";
+                if (!g_opts.function_list.empty()) {
+                    std::cerr << "\033[90mSearched for: ";
+                    for (size_t i = 0; i < g_opts.function_list.size() && i < 5; ++i) {
+                        if (i > 0) std::cerr << ", ";
+                        std::cerr << g_opts.function_list[i];
+                    }
+                    if (g_opts.function_list.size() > 5) {
+                        std::cerr << " (+" << (g_opts.function_list.size() - 5) << " more)";
+                    }
+                    std::cerr << "\033[0m\n";
+                }
+            }
+        }
+
+        if (show_console_info) {
             std::cout << "[*] Processing " << g_stats.total_functions << " functions...\n";
         }
 
@@ -988,21 +1445,45 @@ int main(int argc, char *argv[]) {
             // Normal mode - dump functions
             for (size_t i = 0; i < g_stats.total_functions; ++i) {
                 func_t *pfn = getn_func(i);
-                if (pfn) FunctionDumper::dump(pfn);
+                if (pfn) {
+                    // Get function name for progress display
+                    qstring fname;
+                    get_func_name(&fname, pfn->start_ea);
+
+                    FunctionDumper::dump(pfn);
+
+                    // Update progress (only counts processed, not skipped)
+                    if (!g_opts.output_file.empty()) {
+                        g_stats.processed = g_stats.decompiled_ok + g_stats.decompiled_fail;
+                        g_progress.update(g_stats.processed, fname.c_str());
+                    }
+                }
+            }
+
+            // Finish progress display
+            if (!g_opts.output_file.empty()) {
+                g_progress.finish();
             }
         }
 
-        if (g_opts.show_summary && !g_opts.list_functions) {
+        if (g_opts.show_summary && !g_opts.list_functions && show_console_info) {
             print_summary();
         }
 
-        if (!g_opts.quiet) {
+        if (show_console_info) {
             std::cout << "[*] Done.\n";
         }
     }
     catch (const std::exception &e) {
-        std::cerr << CLR(Red) << "[FATAL] " << CLR(Reset) << e.what() << std::endl;
+        // Force output to real stderr in case it's still redirected
+        real_fprintf(real_stderr, "\033[31m[FATAL]\033[0m %s\n", e.what());
+        real_fflush(real_stderr);
         return EXIT_FAILURE;
+    }
+
+    // Close output file
+    if (g_output_file) {
+        g_output_file->close();
     }
 
     return g_stats.decompiled_fail > 0 ? EXIT_FAILURE : EXIT_SUCCESS;

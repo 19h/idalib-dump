@@ -21,7 +21,11 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
+#include <filesystem>
+
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 
 // Save real setenv/getenv before IDA SDK redefines them with macros
 static inline int real_setenv(const char* name, const char* value) {
@@ -288,12 +292,12 @@ public:
 
             if (idadir && home) {
                 std::string real_idadir = idadir;
-                std::string fake_base = "/tmp/.ida_no_plugins_" + std::to_string(getpid());
-                std::string fake_idadir = fake_base + "/ida";
+                m_fake_idadir_base = "/tmp/.ida_no_plugins_" + std::to_string(getpid());
+                std::string fake_idadir = m_fake_idadir_base + "/ida";
                 std::string fake_plugins = fake_idadir + "/plugins";
 
                 // Create fake IDA directory structure
-                mkdir(fake_base.c_str(), 0755);
+                mkdir(m_fake_idadir_base.c_str(), 0755);
                 mkdir(fake_idadir.c_str(), 0755);
                 mkdir(fake_plugins.c_str(), 0755);
 
@@ -333,7 +337,7 @@ public:
 
                 // Also redirect IDAUSR
                 std::string real_idausr = std::string(home) + "/.idapro";
-                std::string fake_idausr = fake_base + "/user";
+                std::string fake_idausr = m_fake_idadir_base + "/user";
                 mkdir(fake_idausr.c_str(), 0755);
                 symlink((real_idausr + "/ida.reg").c_str(), (fake_idausr + "/ida.reg").c_str());
                 real_setenv("IDAUSR", fake_idausr.c_str());
@@ -370,6 +374,12 @@ public:
         }
         set_database_flag(DBFL_KILL);
         term_database();
+
+        // Clean up fake IDADIR if we created one
+        if (!m_fake_idadir_base.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(m_fake_idadir_base, ec);
+        }
     }
 
     bool hexrays_available() const { return m_hexrays_available; }
@@ -379,6 +389,7 @@ public:
 
 private:
     bool m_hexrays_available = false;
+    std::string m_fake_idadir_base;  // Path to clean up on destruction
 };
 
 //=============================================================================
