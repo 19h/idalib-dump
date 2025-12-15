@@ -59,10 +59,11 @@ static inline int real_fprintf(FILE* stream, const char* fmt, ...) {
 #include <io.h>
 #include <fcntl.h>
 #include <process.h>
-#define dup _dup
-#define dup2 _dup2
-#define close _close
-#define open _open
+// Windows equivalents - use inline functions to avoid macro conflicts with std library
+static inline int posix_dup(int fd) { return _dup(fd); }
+static inline int posix_dup2(int fd1, int fd2) { return _dup2(fd1, fd2); }
+static inline int posix_close(int fd) { return _close(fd); }
+static inline int posix_open(const char* path, int flags) { return _open(path, flags); }
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2
 #define O_WRONLY _O_WRONLY
@@ -71,6 +72,11 @@ static inline int real_fprintf(FILE* stream, const char* fmt, ...) {
 #include <unistd.h>
 #include <dirent.h>
 #include <fcntl.h>
+// POSIX - just use the standard functions
+static inline int posix_dup(int fd) { return dup(fd); }
+static inline int posix_dup2(int fd1, int fd2) { return dup2(fd1, fd2); }
+static inline int posix_close(int fd) { return close(fd); }
+static inline int posix_open(const char* path, int flags) { return open(path, flags); }
 #endif
 
 // From noplugins.c - controls plugin blocking
@@ -989,20 +995,24 @@ static void print_summary() {
 // Resource Management
 //=============================================================================
 
-// RAII helper for redirecting stdout/stderr to /dev/null
+// RAII helper for redirecting stdout/stderr to /dev/null (or NUL on Windows)
 class StdioRedirector {
 public:
     StdioRedirector(bool redirect) : m_active(redirect), m_saved_stdout(-1), m_saved_stderr(-1) {
         if (!redirect) return;
         real_fflush(real_stdout);
         real_fflush(real_stderr);
-        m_saved_stdout = dup(STDOUT_FILENO);
-        m_saved_stderr = dup(STDERR_FILENO);
-        int devnull = open("/dev/null", O_WRONLY);
+        m_saved_stdout = posix_dup(STDOUT_FILENO);
+        m_saved_stderr = posix_dup(STDERR_FILENO);
+#ifdef _WIN32
+        int devnull = posix_open("NUL", O_WRONLY);
+#else
+        int devnull = posix_open("/dev/null", O_WRONLY);
+#endif
         if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
+            posix_dup2(devnull, STDOUT_FILENO);
+            posix_dup2(devnull, STDERR_FILENO);
+            posix_close(devnull);
         }
     }
 
@@ -1014,14 +1024,14 @@ public:
         if (!m_active) return;
         if (m_saved_stdout >= 0) {
             real_fflush(real_stdout);
-            dup2(m_saved_stdout, STDOUT_FILENO);
-            close(m_saved_stdout);
+            posix_dup2(m_saved_stdout, STDOUT_FILENO);
+            posix_close(m_saved_stdout);
             m_saved_stdout = -1;
         }
         if (m_saved_stderr >= 0) {
             real_fflush(real_stderr);
-            dup2(m_saved_stderr, STDERR_FILENO);
-            close(m_saved_stderr);
+            posix_dup2(m_saved_stderr, STDERR_FILENO);
+            posix_close(m_saved_stderr);
             m_saved_stderr = -1;
         }
         m_active = false;
