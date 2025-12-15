@@ -307,7 +307,11 @@ public:
     HeadlessIdaContext(const char *input_file) {
         // Disable plugins by creating a fake IDADIR with empty plugins folder
         if (g_opts.no_plugins) {
-            g_block_plugins = true;
+            // Only block all plugins if no specific plugins were requested
+            // If user specified --plugin patterns, we rely on fake IDADIR to control loading
+            if (g_opts.plugin_patterns.empty()) {
+                g_block_plugins = true;
+            }
 
 #ifndef _WIN32
             const char* idadir = real_getenv("IDADIR");
