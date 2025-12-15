@@ -1126,8 +1126,30 @@ public:
                 // Also redirect IDAUSR
                 std::string real_idausr = std::string(home) + "/.idapro";
                 std::string fake_idausr = m_fake_idadir_base + "/user";
+                std::string fake_user_plugins = fake_idausr + "/plugins";
                 mkdir(fake_idausr.c_str(), 0755);
+                mkdir(fake_user_plugins.c_str(), 0755);
                 symlink((real_idausr + "/ida.reg").c_str(), (fake_idausr + "/ida.reg").c_str());
+
+                // Symlink user plugins matching patterns
+                std::string real_user_plugins = real_idausr + "/plugins";
+                DIR* udir = opendir(real_user_plugins.c_str());
+                if (udir) {
+                    struct dirent* uentry;
+                    while ((uentry = readdir(udir)) != NULL) {
+                        // Check user-specified patterns (no hex* here - those are in IDADIR)
+                        for (const auto& pattern : g_opts.plugin_patterns) {
+                            if (strstr(uentry->d_name, pattern.c_str()) != nullptr) {
+                                std::string src = real_user_plugins + "/" + uentry->d_name;
+                                std::string dst = fake_user_plugins + "/" + uentry->d_name;
+                                symlink(src.c_str(), dst.c_str());
+                                break;
+                            }
+                        }
+                    }
+                    closedir(udir);
+                }
+
                 real_setenv("IDAUSR", fake_idausr.c_str());
             }
 #endif
