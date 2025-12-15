@@ -119,6 +119,7 @@ struct Options {
     std::string filter_pattern;      // Function name filter (regex)
     ea_t filter_address = BADADDR;   // Filter by specific address
     std::vector<std::string> function_list;  // Explicit list of functions (names or addresses)
+    std::vector<std::string> plugin_patterns;  // Additional plugins to load in no-plugins mode
     bool show_assembly = true;
     bool show_microcode = false;
     bool show_pseudocode = true;
@@ -1069,14 +1070,28 @@ public:
                 mkdir(fake_idadir.c_str(), 0755);
                 mkdir(fake_plugins.c_str(), 0755);  // Plugins dir with only hexrays
 
-                // Symlink hexrays decompiler plugins
+                // Symlink hexrays decompiler plugins and user-specified plugins
                 std::string real_plugins = real_idadir + "/plugins";
                 DIR* pdir = opendir(real_plugins.c_str());
                 if (pdir) {
                     struct dirent* pentry;
                     while ((pentry = readdir(pdir)) != NULL) {
-                        // Only symlink hex* files (hexrays decompilers)
+                        bool should_link = false;
+
+                        // Always link hex* plugins (Hex-Rays decompilers)
                         if (strncmp(pentry->d_name, "hex", 3) == 0) {
+                            should_link = true;
+                        }
+
+                        // Check user-specified patterns
+                        for (const auto& pattern : g_opts.plugin_patterns) {
+                            if (strstr(pentry->d_name, pattern.c_str()) != nullptr) {
+                                should_link = true;
+                                break;
+                            }
+                        }
+
+                        if (should_link) {
                             std::string src = real_plugins + "/" + pentry->d_name;
                             std::string dst = fake_plugins + "/" + pentry->d_name;
                             symlink(src.c_str(), dst.c_str());
@@ -1218,7 +1233,9 @@ static void print_usage(const char* prog) {
     std::cout << "  --pseudo-only            Show only pseudocode\n";
     std::cout << "  --no-color               Disable colored output\n";
     std::cout << "  --no-summary             Don't show summary at end\n";
-    std::cout << "  --no-plugins             Don't load user plugins\n";
+    std::cout << "  --no-plugins             Don't load user plugins (except Hex-Rays)\n";
+    std::cout << "  --plugin <pattern>       Load plugins matching pattern (implies --no-plugins)\n";
+    std::cout << "                           Can be specified multiple times\n";
     std::cout << "  -h, --help               Show this help\n";
     std::cout << "\n";
     std::cout << CLR(Cyan) << "Examples:" << CLR(Reset) << "\n";
@@ -1327,6 +1344,14 @@ static bool parse_args(int argc, char* argv[]) {
         }
         else if (arg == "--no-plugins") {
             g_opts.no_plugins = true;
+        }
+        else if (arg == "--plugin") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --plugin requires a pattern argument\n";
+                return false;
+            }
+            g_opts.plugin_patterns.push_back(argv[++i]);
+            g_opts.no_plugins = true;  // --plugin implies --no-plugins
         }
         else if (arg[0] == '-') {
             std::cerr << "Unknown option: " << arg << "\n";

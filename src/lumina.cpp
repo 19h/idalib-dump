@@ -76,6 +76,7 @@ struct Options {
     bool quiet = false;
     bool no_plugins = false;
     bool verbose = false;
+    std::vector<std::string> plugin_patterns;  // Additional plugins to load in no-plugins mode
 };
 
 static Options g_opts;
@@ -323,13 +324,28 @@ public:
                 mkdir(fake_idadir.c_str(), 0755);
                 mkdir(fake_plugins.c_str(), 0755);
 
-                // Symlink hexrays decompiler plugins
+                // Symlink hexrays decompiler plugins and user-specified plugins
                 std::string real_plugins = real_idadir + "/plugins";
                 DIR* pdir = opendir(real_plugins.c_str());
                 if (pdir) {
                     struct dirent* pentry;
                     while ((pentry = readdir(pdir)) != NULL) {
+                        bool should_link = false;
+
+                        // Always link hex* plugins (Hex-Rays decompilers)
                         if (strncmp(pentry->d_name, "hex", 3) == 0) {
+                            should_link = true;
+                        }
+
+                        // Check user-specified patterns
+                        for (const auto& pattern : g_opts.plugin_patterns) {
+                            if (strstr(pentry->d_name, pattern.c_str()) != nullptr) {
+                                should_link = true;
+                                break;
+                            }
+                        }
+
+                        if (should_link) {
                             std::string src = real_plugins + "/" + pentry->d_name;
                             std::string dst = fake_plugins + "/" + pentry->d_name;
                             symlink(src.c_str(), dst.c_str());
@@ -428,7 +444,9 @@ static void print_usage(const char* prog) {
     std::cout << "  -q, --quiet          Suppress IDA's verbose messages\n";
     std::cout << "  -v, --verbose        Show extra debug output\n";
     std::cout << "  --no-color           Disable colored output\n";
-    std::cout << "  --no-plugins         Don't load user plugins\n";
+    std::cout << "  --no-plugins         Don't load user plugins (except Hex-Rays)\n";
+    std::cout << "  --plugin <pattern>   Load plugins matching pattern (implies --no-plugins)\n";
+    std::cout << "                       Can be specified multiple times\n";
     std::cout << "  -h, --help           Show this help\n";
     std::cout << "\n";
     std::cout << CLR(Cyan) << "Examples:" << CLR(Reset) << "\n";
@@ -460,6 +478,14 @@ static bool parse_args(int argc, char* argv[]) {
         }
         else if (arg == "--no-plugins") {
             g_opts.no_plugins = true;
+        }
+        else if (arg == "--plugin") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --plugin requires a pattern argument\n";
+                return false;
+            }
+            g_opts.plugin_patterns.push_back(argv[++i]);
+            g_opts.no_plugins = true;  // --plugin implies --no-plugins
         }
         else if (arg[0] == '-') {
             std::cerr << "Unknown option: " << arg << "\n";
