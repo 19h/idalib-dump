@@ -11,7 +11,19 @@ message(STATUS "Using IDA SDK dir: ${IDASDK}")
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
 endif()
-set(CMAKE_SKIP_RPATH TRUE)
+
+# On macOS, we need to set rpath to find libidalib.dylib and libida.dylib
+# These are linked with @rpath references, so we MUST have an LC_RPATH entry
+if(APPLE)
+    # Don't skip rpath on macOS - we need it for @rpath references to work
+    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+    # Default to IDA's MacOS directory
+    set(IDA_MACOS_DIR "/Applications/IDA Professional 9.3.app/Contents/MacOS" CACHE PATH "Path to IDA MacOS directory")
+    set(CMAKE_BUILD_RPATH "${IDA_MACOS_DIR}")
+    set(CMAKE_INSTALL_RPATH "${IDA_MACOS_DIR}")
+else()
+    set(CMAKE_SKIP_RPATH TRUE)
+endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/ida-cmake/bootstrap.cmake)
 find_package(idasdk REQUIRED)
@@ -36,6 +48,12 @@ ida_add_idalib(ida_dump
 
 target_compile_definitions(ida_dump PRIVATE ASTYLE_LIB ASTYLE_NO_EXPORT)
 target_compile_features(ida_dump PRIVATE cxx_std_17)
+
+# Use flat namespace to work around SDK stub library symbol mismatch
+# (SDK exports qfree etc from libidalib stub but runtime has them in libida)
+if(APPLE)
+    target_link_options(ida_dump PRIVATE -Wl,-flat_namespace)
+endif()
 
 # Generate debug info
 if(MSVC)
