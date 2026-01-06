@@ -432,11 +432,44 @@ static ea_t parse_address(const std::string& str) {
     return BADADDR;
 }
 
+// Helper to get demangled name (returns empty string if demangling fails or name is not mangled)
+static std::string get_demangled_name(const char* mangled_name) {
+    if (!mangled_name || !*mangled_name) return "";
+
+    qstring demangled;
+    // Use 0 for disable_mask (show everything) and DQT_FULL for full demangling
+    if (demangle_name(&demangled, mangled_name, 0, DQT_FULL) > 0) {
+        return demangled.c_str();
+    }
+    return "";
+}
+
+// Check if a pattern matches a name (tries regex first, falls back to substring)
+static bool pattern_matches_name(const std::string& pattern, const char* name) {
+    if (!name || !*name) return false;
+
+    try {
+        std::regex re(pattern, std::regex::icase);
+        if (std::regex_search(name, re)) return true;
+    } catch (const std::regex_error&) {
+        // Fall back to case-insensitive substring match
+        std::string name_lower(name);
+        std::string pattern_lower(pattern);
+        std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);
+        std::transform(pattern_lower.begin(), pattern_lower.end(), pattern_lower.begin(), ::tolower);
+        if (name_lower.find(pattern_lower) != std::string::npos) return true;
+    }
+    return false;
+}
+
 static bool matches_filter(const char* func_name, ea_t func_addr) {
     // Address filter takes precedence
     if (g_opts.filter_address != BADADDR) {
         return func_addr == g_opts.filter_address;
     }
+
+    // Get demangled name once (empty if not mangled or demangling fails)
+    std::string demangled = get_demangled_name(func_name);
 
     // Explicit function list takes precedence over pattern
     if (!g_opts.function_list.empty()) {
@@ -451,32 +484,42 @@ static bool matches_filter(const char* func_name, ea_t func_addr) {
                 continue;
             }
 
-            // Try as exact name match
+            // Try as exact name match (raw name)
             if (item == func_name) return true;
 
-            // Try case-insensitive match
+            // Try as exact name match (demangled name)
+            if (!demangled.empty() && item == demangled) return true;
+
+            // Try case-insensitive match on raw name
             std::string name_lower(func_name);
             std::string item_lower(item);
             std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);
             std::transform(item_lower.begin(), item_lower.end(), item_lower.begin(), ::tolower);
             if (name_lower == item_lower) return true;
+
+            // Try case-insensitive match on demangled name
+            if (!demangled.empty()) {
+                std::string demangled_lower(demangled);
+                std::transform(demangled_lower.begin(), demangled_lower.end(), demangled_lower.begin(), ::tolower);
+                if (demangled_lower == item_lower) return true;
+            }
         }
         return false;
     }
 
-    // Name pattern filter (regex)
+    // Name pattern filter (regex) - match against both raw and demangled names
     if (!g_opts.filter_pattern.empty()) {
-        try {
-            std::regex pattern(g_opts.filter_pattern, std::regex::icase);
-            return std::regex_search(func_name, pattern);
-        } catch (const std::regex_error&) {
-            // Fall back to substring match
-            std::string name_lower(func_name);
-            std::string pattern_lower(g_opts.filter_pattern);
-            std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);
-            std::transform(pattern_lower.begin(), pattern_lower.end(), pattern_lower.begin(), ::tolower);
-            return name_lower.find(pattern_lower) != std::string::npos;
+        // Try matching raw name first
+        if (pattern_matches_name(g_opts.filter_pattern, func_name)) {
+            return true;
         }
+
+        // Try matching demangled name
+        if (!demangled.empty() && pattern_matches_name(g_opts.filter_pattern, demangled.c_str())) {
+            return true;
+        }
+
+        return false;
     }
 
     return true;
