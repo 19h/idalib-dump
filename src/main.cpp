@@ -1221,12 +1221,6 @@ public:
 
         // Disable plugins by creating a fake IDADIR with empty plugins folder
         if (g_opts.no_plugins) {
-            // Only block all plugins if no specific plugins were requested
-            // If user specified --plugin patterns, we rely on fake IDADIR to control loading
-            if (g_opts.plugin_patterns.empty()) {
-                g_block_plugins = true;
-            }
-
 #ifndef _WIN32
             const char* idadir_env = real_getenv("IDADIR");
             const char* home = real_getenv("HOME");
@@ -1253,49 +1247,20 @@ public:
                 std::string fake_idadir = m_fake_idadir_base + "/ida";
                 std::string fake_plugins = fake_idadir + "/plugins";
 
-                // Create fake IDA directory structure
+                // Create fake IDA directory structure that keeps all Hex-Rays
+                // system plugins (from IDADIR/plugins/) but blocks user plugins
+                // (from IDAUSR/plugins/) unless they match --plugin patterns.
                 mkdir(m_fake_idadir_base.c_str(), 0755);
                 mkdir(fake_idadir.c_str(), 0755);
-                mkdir(fake_plugins.c_str(), 0755);  // Plugins dir with only hexrays
 
-                // Symlink hexrays decompiler plugins and user-specified plugins
-                std::string real_plugins = real_idadir + "/plugins";
-                DIR* pdir = opendir(real_plugins.c_str());
-                if (pdir) {
-                    struct dirent* pentry;
-                    while ((pentry = readdir(pdir)) != NULL) {
-                        bool should_link = false;
-
-                        // Always link hex* plugins (Hex-Rays decompilers)
-                        if (strncmp(pentry->d_name, "hex", 3) == 0) {
-                            should_link = true;
-                        }
-
-                        // Check user-specified patterns
-                        for (const auto& pattern : g_opts.plugin_patterns) {
-                            if (strstr(pentry->d_name, pattern.c_str()) != nullptr) {
-                                should_link = true;
-                                break;
-                            }
-                        }
-
-                        if (should_link) {
-                            std::string src = real_plugins + "/" + pentry->d_name;
-                            std::string dst = fake_plugins + "/" + pentry->d_name;
-                            symlink(src.c_str(), dst.c_str());
-                        }
-                    }
-                    closedir(pdir);
-                }
-
-                // Symlink all entries from real IDADIR except plugins
+                // Symlink everything from IDADIR as-is (including plugins/)
+                // All plugins in IDADIR are Hex-Rays system plugins and should load.
                 DIR* dir = opendir(real_idadir.c_str());
                 if (dir) {
                     struct dirent* entry;
                     while ((entry = readdir(dir)) != NULL) {
                         if (strcmp(entry->d_name, ".") == 0 ||
-                            strcmp(entry->d_name, "..") == 0 ||
-                            strcmp(entry->d_name, "plugins") == 0) {
+                            strcmp(entry->d_name, "..") == 0) {
                             continue;
                         }
                         std::string src = real_idadir + "/" + entry->d_name;
@@ -1460,9 +1425,9 @@ static void print_usage(const char* prog) {
     std::cout << "  --pseudo-only            Show only pseudocode\n";
     std::cout << "  --no-color               Disable colored output\n";
     std::cout << "  --no-summary             Don't show summary at end\n";
-    std::cout << "  --no-plugins             Don't load user plugins (except Hex-Rays)\n";
-    std::cout << "  --plugin <pattern>       Load plugins matching pattern (implies --no-plugins)\n";
-    std::cout << "                           Can be specified multiple times\n";
+    std::cout << "  --no-plugins             Don't load user plugins (keeps IDA built-in plugins)\n";
+    std::cout << "  --plugin <pattern>       Also load user plugins matching pattern (comma-separated)\n";
+    std::cout << "                           Implies --no-plugins. Can be specified multiple times\n";
      std::cout << "  -h, --help               Show this help\n";
     std::cout << "  --version                Show build info (SDK path, runtime lib path)\n";
     std::cout << "\n";
@@ -1592,7 +1557,8 @@ static bool parse_args(int argc, char* argv[]) {
                 std::cerr << "Error: --plugin requires a pattern argument\n";
                 return false;
             }
-            g_opts.plugin_patterns.push_back(argv[++i]);
+            auto patterns = split_string(argv[++i]);
+            g_opts.plugin_patterns.insert(g_opts.plugin_patterns.end(), patterns.begin(), patterns.end());
             g_opts.no_plugins = true;  // --plugin implies --no-plugins
         }
         else if (arg[0] == '-') {
