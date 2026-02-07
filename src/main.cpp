@@ -108,6 +108,7 @@ extern "C" {
 //=============================================================================
 
 hexdsp_t *hexdsp = nullptr;
+static bool g_hexrays_available = false;
 
 //=============================================================================
 // Command Line Options
@@ -813,6 +814,16 @@ public:
             return true;
         }
 
+        // If Hex-Rays is not available, just dump assembly
+        if (!g_hexrays_available) {
+            print_header(pfn, fname.c_str(), true);  // Always "success" for asm-only
+            if (g_opts.show_assembly) {
+                dump_assembly(pfn);
+            }
+            g_stats.decompiled_ok++;
+            return true;
+        }
+
         // Now decompile (only for functions that pass the filter)
         hexrays_failure_t hf;
         cfuncptr_t cfunc = decompile(pfn, &hf, DECOMP_WARNINGS);
@@ -1216,10 +1227,25 @@ public:
             std::cout << "[*] Analysis complete." << std::endl;
         }
 
-        if (!init_hexrays_plugin()) {
-            set_database_flag(DBFL_KILL);
-            term_database();
-            throw std::runtime_error("Hex-Rays decompiler not available.");
+        if (init_hexrays_plugin()) {
+            g_hexrays_available = true;
+        } else {
+            g_hexrays_available = false;
+            // Disable pseudocode and microcode since they require Hex-Rays
+            bool had_decompiler_features = g_opts.show_pseudocode || g_opts.show_microcode;
+            g_opts.show_pseudocode = false;
+            g_opts.show_microcode = false;
+            if (!g_opts.quiet && had_decompiler_features) {
+                std::cerr << "\033[33m[WARNING]\033[0m Hex-Rays decompiler not available. "
+                          << "Pseudocode and microcode output disabled.\n";
+            }
+            // Ensure assembly is shown if nothing else would be
+            if (!g_opts.show_assembly) {
+                g_opts.show_assembly = true;
+                if (!g_opts.quiet) {
+                    std::cerr << "\033[90m[INFO]\033[0m Falling back to assembly-only output.\n";
+                }
+            }
         }
 
         // Explicitly restore before leaving constructor (RAII destructor would also do it)
@@ -1227,7 +1253,9 @@ public:
     }
 
     ~HeadlessIdaContext() {
-        term_hexrays_plugin();
+        if (g_hexrays_available) {
+            term_hexrays_plugin();
+        }
         set_database_flag(DBFL_KILL);
         term_database();
 
