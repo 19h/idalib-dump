@@ -72,6 +72,13 @@ static inline int posix_open(const char* path, int flags) { return _open(path, f
 #include <unistd.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <dlfcn.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+#ifdef __linux__
+#include <link.h>
+#endif
 // POSIX - just use the standard functions
 static inline int posix_dup(int fd) { return dup(fd); }
 static inline int posix_dup2(int fd1, int fd2) { return dup2(fd1, fd2); }
@@ -760,6 +767,87 @@ static void print_segments() {
                perms,
                seg_name.c_str());
     }
+    std::cout << "\n";
+}
+
+// Resolve the shared library path that provides a given symbol address.
+static std::string resolve_module_path(void* addr) {
+    Dl_info info;
+    if (addr && dladdr(addr, &info) && info.dli_fname)
+        return info.dli_fname;
+    return {};
+}
+
+static void print_loaded_modules() {
+    std::cout << CLR(Bold) << "Loaded Modules" << CLR(Reset) << "\n";
+    std::cout << std::string(78, '-') << "\n";
+
+    // Probe well-known symbols to find which libraries are actually providing them.
+    // This is more reliable than _dyld_get_image_name() which can report paths
+    // that differ from the rpath-resolved ones after IDA's init_library().
+    struct Probe {
+        const char* label;
+        void*       addr;
+    };
+
+    Probe probes[] = {
+        { "ida_dump",   (void*)&print_loaded_modules },
+        { "libida",     (void*)dlsym(RTLD_DEFAULT, "qalloc") },
+        { "libidalib",  (void*)dlsym(RTLD_DEFAULT, "init_library") },
+    };
+
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
+        const auto& p = probes[i];
+        std::string path = resolve_module_path(p.addr);
+        if (path.empty()) continue;
+        std::string basename = path.substr(path.rfind('/') + 1);
+        std::cout << "  " << CLR(Cyan) << basename << CLR(Reset)
+                  << "\n    " << CLR(Dim) << path << CLR(Reset) << "\n";
+    }
+
+    // Scan for additional IDA modules (plugins, loaders) that can't be
+    // probed via dlsym because they don't export well-known symbols.
+    auto print_module = [](const std::string& path) {
+        std::string basename = path.substr(path.rfind('/') + 1);
+        std::cout << "  " << CLR(Cyan) << basename << CLR(Reset)
+                  << "\n    " << CLR(Dim) << path << CLR(Reset) << "\n";
+    };
+
+    auto is_ida_plugin = [](const std::string& name) {
+        // Skip Python bindings (_ida_*.so) — only match native plugins
+        if (name.find("_ida_") == 0) return false;
+        return name.find("hexrays") != std::string::npos
+            || name.find("hexx64") != std::string::npos;
+    };
+
+#if defined(__APPLE__)
+    {
+        uint32_t count = _dyld_image_count();
+        for (uint32_t i = 0; i < count; i++) {
+            const char* path = _dyld_get_image_name(i);
+            if (!path) continue;
+            std::string p(path);
+            std::string basename = p.substr(p.rfind('/') + 1);
+            if (is_ida_plugin(basename))
+                print_module(p);
+        }
+    }
+#elif defined(__linux__)
+    {
+        struct PrintCtx { decltype(print_module)* fn; decltype(is_ida_plugin)* filter; };
+        PrintCtx ctx = { &print_module, &is_ida_plugin };
+        dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {
+            auto* c = static_cast<PrintCtx*>(data);
+            if (!info->dlpi_name || !info->dlpi_name[0]) return 0;
+            std::string p(info->dlpi_name);
+            std::string basename = p.substr(p.rfind('/') + 1);
+            if ((*c->filter)(basename))
+                (*c->fn)(p);
+            return 0;
+        }, &ctx);
+    }
+#endif
+
     std::cout << "\n";
 }
 
@@ -1532,6 +1620,7 @@ int main(int argc, char *argv[]) {
             print_binary_info();
             if (g_opts.verbose) {
                 print_segments();
+                print_loaded_modules();
             }
         }
 
