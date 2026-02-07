@@ -805,20 +805,36 @@ static void print_loaded_modules() {
                   << "\n    " << CLR(Dim) << path << CLR(Reset) << "\n";
     }
 
-    // Scan for additional IDA modules (plugins, loaders) that can't be
-    // probed via dlsym because they don't export well-known symbols.
-    auto print_module = [](const std::string& path) {
+    // Scan loaded images for IDA plugins, decompilers, and processor modules.
+    // We look for modules in plugins/, procs/, and loaders/ subdirectories,
+    // filtering out test/sample plugins and Python bindings.
+    auto is_interesting = [](const std::string& path) {
+        // Must be in a plugins/, procs/, or loaders/ directory
+        bool in_plugins = path.find("/plugins/") != std::string::npos;
+        bool in_procs   = path.find("/procs/") != std::string::npos;
+        bool in_loaders = path.find("/loaders/") != std::string::npos;
+        if (!in_plugins && !in_procs && !in_loaders) return false;
+
+        // Skip Python bindings
         std::string basename = path.substr(path.rfind('/') + 1);
-        std::cout << "  " << CLR(Cyan) << basename << CLR(Reset)
-                  << "\n    " << CLR(Dim) << path << CLR(Reset) << "\n";
+        if (basename.find("_ida_") == 0) return false;
+
+        if (in_plugins) {
+            // Only show decompilers (hex*) and user plugins (~/.idapro/)
+            bool is_decompiler = basename.find("hex") == 0;
+            bool is_user = path.find("/.idapro/") != std::string::npos;
+            return is_decompiler || is_user;
+        }
+
+        // Show active processor module and loaders
+        return true;
     };
 
-    auto is_ida_plugin = [](const std::string& name) {
-        // Skip Python bindings (_ida_*.so) — only match native plugins
-        if (name.find("_ida_") == 0) return false;
-        return name.find("hexrays") != std::string::npos
-            || name.find("hexx64") != std::string::npos;
+    struct ModuleEntry {
+        std::string path;
+        std::string name;
     };
+    std::vector<ModuleEntry> extra;
 
 #if defined(__APPLE__)
     {
@@ -827,26 +843,36 @@ static void print_loaded_modules() {
             const char* path = _dyld_get_image_name(i);
             if (!path) continue;
             std::string p(path);
-            std::string basename = p.substr(p.rfind('/') + 1);
-            if (is_ida_plugin(basename))
-                print_module(p);
+            if (is_interesting(p))
+                extra.push_back({p, p.substr(p.rfind('/') + 1)});
         }
     }
 #elif defined(__linux__)
-    {
-        struct PrintCtx { decltype(print_module)* fn; decltype(is_ida_plugin)* filter; };
-        PrintCtx ctx = { &print_module, &is_ida_plugin };
-        dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {
-            auto* c = static_cast<PrintCtx*>(data);
-            if (!info->dlpi_name || !info->dlpi_name[0]) return 0;
-            std::string p(info->dlpi_name);
-            std::string basename = p.substr(p.rfind('/') + 1);
-            if ((*c->filter)(basename))
-                (*c->fn)(p);
-            return 0;
-        }, &ctx);
-    }
+    dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {
+        auto* vec = static_cast<std::vector<ModuleEntry>*>(data);
+        if (!info->dlpi_name || !info->dlpi_name[0]) return 0;
+        std::string p(info->dlpi_name);
+        std::string basename = p.substr(p.rfind('/') + 1);
+        // Apply same filter logic inline (can't capture lambdas)
+        bool in_plugins = p.find("/plugins/") != std::string::npos;
+        bool in_procs   = p.find("/procs/") != std::string::npos;
+        bool in_loaders = p.find("/loaders/") != std::string::npos;
+        if (!in_plugins && !in_procs && !in_loaders) return 0;
+        if (basename.find("_ida_") == 0) return 0;
+        if (in_plugins) {
+            bool is_decompiler = basename.find("hex") == 0;
+            bool is_user = p.find("/.idapro/") != std::string::npos;
+            if (!is_decompiler && !is_user) return 0;
+        }
+        vec->push_back({p, basename});
+        return 0;
+    }, &extra);
 #endif
+
+    for (const auto& mod : extra) {
+        std::cout << "  " << CLR(Cyan) << mod.name << CLR(Reset)
+                  << "\n    " << CLR(Dim) << mod.path << CLR(Reset) << "\n";
+    }
 
     std::cout << "\n";
 }
@@ -1202,8 +1228,24 @@ public:
             }
 
 #ifndef _WIN32
-            const char* idadir = real_getenv("IDADIR");
+            const char* idadir_env = real_getenv("IDADIR");
             const char* home = real_getenv("HOME");
+
+            // If IDADIR isn't set, derive it from libida.dylib's location
+            // (which is resolved via rpath at load time)
+            std::string detected_idadir;
+            if (!idadir_env) {
+                void* libida_sym = dlsym(RTLD_DEFAULT, "qalloc");
+                Dl_info dli;
+                if (libida_sym && dladdr(libida_sym, &dli) && dli.dli_fname) {
+                    std::string libida_path(dli.dli_fname);
+                    auto slash = libida_path.rfind('/');
+                    if (slash != std::string::npos)
+                        detected_idadir = libida_path.substr(0, slash);
+                }
+            }
+
+            const char* idadir = idadir_env ? idadir_env : (detected_idadir.empty() ? nullptr : detected_idadir.c_str());
 
             if (idadir && home) {
                 std::string real_idadir = idadir;
