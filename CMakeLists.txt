@@ -52,6 +52,19 @@ ida_add_idalib(ida_dump
 target_compile_definitions(ida_dump PRIVATE ASTYLE_LIB ASTYLE_NO_EXPORT)
 target_compile_features(ida_dump PRIVATE cxx_std_17)
 
+# Bake build info into the binary
+target_compile_definitions(ida_dump PRIVATE
+    BUILD_IDASDK_DIR="${IDASDK}"
+    BUILD_IDA_LIBDIR="$<$<BOOL:${IDA_MACOS_DIR}>:${IDA_MACOS_DIR}>"
+    BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+)
+
+# Create 'idump' as a copy of ida_dump
+add_custom_command(TARGET ida_dump POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:ida_dump> ${CMAKE_BINARY_DIR}/idump$<TARGET_FILE_SUFFIX:ida_dump>
+    COMMENT "Creating idump"
+)
+
 # Use flat namespace to work around SDK stub library symbol mismatch
 # (SDK exports qfree etc from libidalib stub but runtime has them in libida)
 if(APPLE)

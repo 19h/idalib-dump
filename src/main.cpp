@@ -1333,7 +1333,8 @@ static void print_usage(const char* prog) {
     std::cout << "  --no-plugins             Don't load user plugins (except Hex-Rays)\n";
     std::cout << "  --plugin <pattern>       Load plugins matching pattern (implies --no-plugins)\n";
     std::cout << "                           Can be specified multiple times\n";
-    std::cout << "  -h, --help               Show this help\n";
+     std::cout << "  -h, --help               Show this help\n";
+    std::cout << "  --version                Show build info (SDK path, runtime lib path)\n";
     std::cout << "\n";
     std::cout << CLR(Cyan) << "Examples:" << CLR(Reset) << "\n";
     std::cout << "  " << prog << " program.exe                        # Dump all functions\n";
@@ -1355,6 +1356,20 @@ static bool parse_args(int argc, char* argv[]) {
 
         if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
+            exit(0);
+        }
+        else if (arg == "--version") {
+            std::cout << "ida_dump (idalib-dump)\n";
+#ifdef BUILD_IDASDK_DIR
+            std::cout << "  SDK:     " << BUILD_IDASDK_DIR << "\n";
+#endif
+#ifdef BUILD_IDA_LIBDIR
+            if (strlen(BUILD_IDA_LIBDIR) > 0)
+                std::cout << "  libdir:  " << BUILD_IDA_LIBDIR << "\n";
+#endif
+#ifdef BUILD_TYPE
+            std::cout << "  build:   " << BUILD_TYPE << "\n";
+#endif
             exit(0);
         }
         else if (arg == "-o" || arg == "--output") {
