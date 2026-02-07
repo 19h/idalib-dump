@@ -5,6 +5,9 @@ project(idalib-dump)
 set(IDASDK_VER "92" CACHE STRING "92")
 set(IDASDK $ENV{IDASDK} CACHE PATH "Path to IDA SDK")
 
+# Propagate -DIDASDK= to the environment so bootstrap.cmake picks it up
+set(ENV{IDASDK} "${IDASDK}")
+
 message(STATUS "Building ${PROJECT_NAME}")
 message(STATUS "Using IDA SDK dir: ${IDASDK}")
 

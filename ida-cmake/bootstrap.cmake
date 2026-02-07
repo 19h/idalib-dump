@@ -11,16 +11,18 @@ if(NOT EXISTS "$ENV{IDASDK}")
     message(FATAL_ERROR "IDASDK path does not exist: $ENV{IDASDK}")
 endif()
 
-# Auto-detect SDK structure: GitHub clone has files under src/, zip distribution at root
+# Auto-detect SDK structure by probing for include/pro.h in known layouts
 set(_IDASDK_ACTUAL "$ENV{IDASDK}")
-if(NOT EXISTS "${_IDASDK_ACTUAL}/include/pro.h")
-    # Check if this is a GitHub clone with src/ subdirectory
-    if(EXISTS "${_IDASDK_ACTUAL}/src/include/pro.h")
-        set(_IDASDK_ACTUAL "${_IDASDK_ACTUAL}/src")
-        message(STATUS "Detected GitHub SDK structure, using: ${_IDASDK_ACTUAL}")
-    else()
-        message(FATAL_ERROR "Invalid IDASDK directory (missing include/pro.h): $ENV{IDASDK}")
-    endif()
+if(EXISTS "${_IDASDK_ACTUAL}/include/pro.h" AND EXISTS "${_IDASDK_ACTUAL}/include/llong.hpp")
+    # Standard SDK layout
+elseif(EXISTS "${_IDASDK_ACTUAL}/sdk/obj/include/pro.h")
+    set(_IDASDK_ACTUAL "${_IDASDK_ACTUAL}/sdk/obj")
+    message(STATUS "Detected SDK at: ${_IDASDK_ACTUAL}")
+elseif(EXISTS "${_IDASDK_ACTUAL}/src/include/pro.h")
+    set(_IDASDK_ACTUAL "${_IDASDK_ACTUAL}/src")
+    message(STATUS "Detected SDK at: ${_IDASDK_ACTUAL}")
+else()
+    message(FATAL_ERROR "Invalid IDASDK directory (missing include/pro.h): $ENV{IDASDK}")
 endif()
 
 # Override IDASDK environment variable for this CMake run with the adjusted path
