@@ -52,6 +52,11 @@ ida_add_idalib(ida_dump
 target_compile_definitions(ida_dump PRIVATE ASTYLE_LIB ASTYLE_NO_EXPORT)
 target_compile_features(ida_dump PRIVATE cxx_std_17)
 
+# Link psapi for EnumProcessModules (loaded module enumeration)
+if(WIN32)
+    target_link_libraries(ida_dump PRIVATE psapi)
+endif()
+
 # Bake build info into the binary
 target_compile_definitions(ida_dump PRIVATE
     BUILD_IDASDK_DIR="${IDASDK}"

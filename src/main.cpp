@@ -59,6 +59,9 @@ static inline int real_fprintf(FILE* stream, const char* fmt, ...) {
 #include <io.h>
 #include <fcntl.h>
 #include <process.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <psapi.h>
 // Windows equivalents - use inline functions to avoid macro conflicts with std library
 static inline int posix_dup(int fd) { return _dup(fd); }
 static inline int posix_dup2(int fd1, int fd2) { return _dup2(fd1, fd2); }
@@ -772,10 +775,24 @@ static void print_segments() {
 
 // Resolve the shared library path that provides a given symbol address.
 static std::string resolve_module_path(void* addr) {
+    if (!addr) return {};
+#ifdef _WIN32
+    HMODULE hmod = nullptr;
+    if (!GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)addr, &hmod))
+        return {};
+    char path[MAX_PATH];
+    DWORD len = GetModuleFileNameA(hmod, path, sizeof(path));
+    if (len == 0 || len >= sizeof(path)) return {};
+    return std::string(path, len);
+#else
     Dl_info info;
-    if (addr && dladdr(addr, &info) && info.dli_fname)
+    if (dladdr(addr, &info) && info.dli_fname)
         return info.dli_fname;
     return {};
+#endif
 }
 
 static void print_loaded_modules() {
@@ -790,17 +807,38 @@ static void print_loaded_modules() {
         void*       addr;
     };
 
+    auto lookup_sym = [](const char* name) -> void* {
+#ifdef _WIN32
+        // On Windows, try ida.dll and idalib.dll for IDA's exported symbols.
+        for (const char* mod : {"ida.dll", "idalib.dll"}) {
+            HMODULE h = GetModuleHandleA(mod);
+            if (!h) continue;
+            void* p = (void*)GetProcAddress(h, name);
+            if (p) return p;
+        }
+        return nullptr;
+#else
+        return dlsym(RTLD_DEFAULT, name);
+#endif
+    };
+
     Probe probes[] = {
         { "ida_dump",   (void*)&print_loaded_modules },
-        { "libida",     (void*)dlsym(RTLD_DEFAULT, "qalloc") },
-        { "libidalib",  (void*)dlsym(RTLD_DEFAULT, "init_library") },
+        { "libida",     lookup_sym("qalloc") },
+        { "libidalib",  lookup_sym("init_library") },
+    };
+
+    // Extract filename from path, handling both '/' and '\' separators.
+    auto path_basename = [](const std::string& p) -> std::string {
+        auto pos = p.find_last_of("/\\");
+        return (pos == std::string::npos) ? p : p.substr(pos + 1);
     };
 
     for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
         const auto& p = probes[i];
         std::string path = resolve_module_path(p.addr);
         if (path.empty()) continue;
-        std::string basename = path.substr(path.rfind('/') + 1);
+        std::string basename = path_basename(path);
         std::cout << "  " << CLR(Cyan) << basename << CLR(Reset)
                   << "\n    " << CLR(Dim) << path << CLR(Reset) << "\n";
     }
@@ -808,21 +846,29 @@ static void print_loaded_modules() {
     // Scan loaded images for IDA plugins, decompilers, and processor modules.
     // We look for modules in plugins/, procs/, and loaders/ subdirectories,
     // filtering out test/sample plugins and Python bindings.
-    auto is_interesting = [](const std::string& path) {
+    // Check for a directory component using both separator styles.
+    auto has_dir = [](const std::string& p, const char* dir) {
+        std::string fwd = std::string("/") + dir + "/";
+        std::string bwd = std::string("\\") + dir + "\\";
+        return p.find(fwd) != std::string::npos ||
+               p.find(bwd) != std::string::npos;
+    };
+
+    auto is_interesting = [&](const std::string& path) {
         // Must be in a plugins/, procs/, or loaders/ directory
-        bool in_plugins = path.find("/plugins/") != std::string::npos;
-        bool in_procs   = path.find("/procs/") != std::string::npos;
-        bool in_loaders = path.find("/loaders/") != std::string::npos;
+        bool in_plugins = has_dir(path, "plugins");
+        bool in_procs   = has_dir(path, "procs");
+        bool in_loaders = has_dir(path, "loaders");
         if (!in_plugins && !in_procs && !in_loaders) return false;
 
         // Skip Python bindings
-        std::string basename = path.substr(path.rfind('/') + 1);
+        std::string basename = path_basename(path);
         if (basename.find("_ida_") == 0) return false;
 
         if (in_plugins) {
-            // Only show decompilers (hex*) and user plugins (~/.idapro/)
+            // Only show decompilers (hex*) and user plugins (~/.idapro/ or AppData)
             bool is_decompiler = basename.find("hex") == 0;
-            bool is_user = path.find("/.idapro/") != std::string::npos;
+            bool is_user = has_dir(path, ".idapro");
             return is_decompiler || is_user;
         }
 
@@ -844,7 +890,7 @@ static void print_loaded_modules() {
             if (!path) continue;
             std::string p(path);
             if (is_interesting(p))
-                extra.push_back({p, p.substr(p.rfind('/') + 1)});
+                extra.push_back({p, path_basename(p)});
         }
     }
 #elif defined(__linux__)
@@ -852,7 +898,8 @@ static void print_loaded_modules() {
         auto* vec = static_cast<std::vector<ModuleEntry>*>(data);
         if (!info->dlpi_name || !info->dlpi_name[0]) return 0;
         std::string p(info->dlpi_name);
-        std::string basename = p.substr(p.rfind('/') + 1);
+        auto pos = p.find_last_of("/\\");
+        std::string basename = (pos == std::string::npos) ? p : p.substr(pos + 1);
         // Apply same filter logic inline (can't capture lambdas)
         bool in_plugins = p.find("/plugins/") != std::string::npos;
         bool in_procs   = p.find("/procs/") != std::string::npos;
@@ -867,6 +914,22 @@ static void print_loaded_modules() {
         vec->push_back({p, basename});
         return 0;
     }, &extra);
+#elif defined(_WIN32)
+    {
+        HANDLE proc = GetCurrentProcess();
+        HMODULE hmods[1024];
+        DWORD needed = 0;
+        if (EnumProcessModules(proc, hmods, sizeof(hmods), &needed)) {
+            DWORD count = needed / sizeof(HMODULE);
+            for (DWORD i = 0; i < count; i++) {
+                char path[MAX_PATH];
+                if (!GetModuleFileNameA(hmods[i], path, sizeof(path))) continue;
+                std::string p(path);
+                if (is_interesting(p))
+                    extra.push_back({p, path_basename(p)});
+            }
+        }
+    }
 #endif
 
     for (const auto& mod : extra) {
