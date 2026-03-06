@@ -305,67 +305,41 @@ public:
 class HeadlessIdaContext {
 public:
     HeadlessIdaContext(const char *input_file) {
-        // Disable plugins by creating a fake IDADIR with empty plugins folder
         if (g_opts.no_plugins) {
-            // Only block all plugins if no specific plugins were requested
-            // If user specified --plugin patterns, we rely on fake IDADIR to control loading
-            if (g_opts.plugin_patterns.empty()) {
-                g_block_plugins = true;
+#ifndef _WIN32
+            const char* idadir_env = real_getenv("IDADIR");
+            const char* home = real_getenv("HOME");
+
+            std::string detected_idadir;
+            if (!idadir_env) {
+                void* libida_sym = dlsym(RTLD_DEFAULT, "qalloc");
+                Dl_info dli;
+                if (libida_sym && dladdr(libida_sym, &dli) && dli.dli_fname) {
+                    std::string libida_path(dli.dli_fname);
+                    auto slash = libida_path.rfind('/');
+                    if (slash != std::string::npos) {
+                        detected_idadir = libida_path.substr(0, slash);
+                    }
+                }
             }
 
-#ifndef _WIN32
-            const char* idadir = real_getenv("IDADIR");
-            const char* home = real_getenv("HOME");
+            const char* idadir = idadir_env ? idadir_env : (detected_idadir.empty() ? nullptr : detected_idadir.c_str());
 
             if (idadir && home) {
                 std::string real_idadir = idadir;
                 m_fake_idadir_base = "/tmp/.ida_no_plugins_" + std::to_string(getpid());
                 std::string fake_idadir = m_fake_idadir_base + "/ida";
-                std::string fake_plugins = fake_idadir + "/plugins";
 
-                // Create fake IDA directory structure
                 mkdir(m_fake_idadir_base.c_str(), 0755);
                 mkdir(fake_idadir.c_str(), 0755);
-                mkdir(fake_plugins.c_str(), 0755);
 
-                // Symlink hexrays decompiler plugins and user-specified plugins
-                std::string real_plugins = real_idadir + "/plugins";
-                DIR* pdir = opendir(real_plugins.c_str());
-                if (pdir) {
-                    struct dirent* pentry;
-                    while ((pentry = readdir(pdir)) != NULL) {
-                        bool should_link = false;
-
-                        // Always link hex* plugins (Hex-Rays decompilers)
-                        if (strncmp(pentry->d_name, "hex", 3) == 0) {
-                            should_link = true;
-                        }
-
-                        // Check user-specified patterns
-                        for (const auto& pattern : g_opts.plugin_patterns) {
-                            if (strstr(pentry->d_name, pattern.c_str()) != nullptr) {
-                                should_link = true;
-                                break;
-                            }
-                        }
-
-                        if (should_link) {
-                            std::string src = real_plugins + "/" + pentry->d_name;
-                            std::string dst = fake_plugins + "/" + pentry->d_name;
-                            symlink(src.c_str(), dst.c_str());
-                        }
-                    }
-                    closedir(pdir);
-                }
-
-                // Symlink all entries from real IDADIR except plugins
+                // Mirror IDADIR so bundled Hex-Rays/system plugins still load.
                 DIR* dir = opendir(real_idadir.c_str());
                 if (dir) {
                     struct dirent* entry;
                     while ((entry = readdir(dir)) != NULL) {
                         if (strcmp(entry->d_name, ".") == 0 ||
-                            strcmp(entry->d_name, "..") == 0 ||
-                            strcmp(entry->d_name, "plugins") == 0) {
+                            strcmp(entry->d_name, "..") == 0) {
                             continue;
                         }
                         std::string src = real_idadir + "/" + entry->d_name;
@@ -377,35 +351,81 @@ public:
 
                 real_setenv("IDADIR", fake_idadir.c_str());
 
-                // Also redirect IDAUSR
                 std::string real_idausr = std::string(home) + "/.idapro";
                 std::string fake_idausr = m_fake_idadir_base + "/user";
-                std::string fake_user_plugins = fake_idausr + "/plugins";
                 mkdir(fake_idausr.c_str(), 0755);
-                mkdir(fake_user_plugins.c_str(), 0755);
-                symlink((real_idausr + "/ida.reg").c_str(), (fake_idausr + "/ida.reg").c_str());
 
-                // Symlink user plugins matching patterns
-                std::string real_user_plugins = real_idausr + "/plugins";
-                DIR* udir = opendir(real_user_plugins.c_str());
+                auto symlink_user_dir_unique = [&](const char* subdir) {
+                    std::string user_dir = real_idausr + "/" + subdir;
+                    std::string fake_dir = fake_idausr + "/" + subdir;
+                    std::string sys_dir = real_idadir + "/" + subdir;
+                    mkdir(fake_dir.c_str(), 0755);
+                    DIR* d = opendir(user_dir.c_str());
+                    if (!d) {
+                        return;
+                    }
+                    struct dirent* e;
+                    while ((e = readdir(d)) != NULL) {
+                        if (e->d_name[0] == '.') {
+                            continue;
+                        }
+                        std::string sys_path = sys_dir + "/" + e->d_name;
+                        struct stat st;
+                        if (stat(sys_path.c_str(), &st) == 0) {
+                            continue;
+                        }
+                        std::string src = user_dir + "/" + e->d_name;
+                        std::string dst = fake_dir + "/" + e->d_name;
+                        symlink(src.c_str(), dst.c_str());
+                    }
+                    closedir(d);
+                };
+
+                DIR* udir = opendir(real_idausr.c_str());
                 if (udir) {
                     struct dirent* uentry;
                     while ((uentry = readdir(udir)) != NULL) {
-                        // Check user-specified patterns (no hex* here - those are in IDADIR)
+                        if (strcmp(uentry->d_name, ".") == 0 ||
+                            strcmp(uentry->d_name, "..") == 0 ||
+                            strcmp(uentry->d_name, "plugins") == 0 ||
+                            strcmp(uentry->d_name, "procs") == 0 ||
+                            strcmp(uentry->d_name, "loaders") == 0) {
+                            continue;
+                        }
+                        std::string src = real_idausr + "/" + uentry->d_name;
+                        std::string dst = fake_idausr + "/" + uentry->d_name;
+                        symlink(src.c_str(), dst.c_str());
+                    }
+                    closedir(udir);
+                }
+
+                symlink_user_dir_unique("procs");
+                symlink_user_dir_unique("loaders");
+
+                std::string fake_user_plugins = fake_idausr + "/plugins";
+                mkdir(fake_user_plugins.c_str(), 0755);
+
+                std::string real_user_plugins = real_idausr + "/plugins";
+                DIR* pdir = opendir(real_user_plugins.c_str());
+                if (pdir) {
+                    struct dirent* pentry;
+                    while ((pentry = readdir(pdir)) != NULL) {
                         for (const auto& pattern : g_opts.plugin_patterns) {
-                            if (strstr(uentry->d_name, pattern.c_str()) != nullptr) {
-                                std::string src = real_user_plugins + "/" + uentry->d_name;
-                                std::string dst = fake_user_plugins + "/" + uentry->d_name;
+                            if (strstr(pentry->d_name, pattern.c_str()) != nullptr) {
+                                std::string src = real_user_plugins + "/" + pentry->d_name;
+                                std::string dst = fake_user_plugins + "/" + pentry->d_name;
                                 symlink(src.c_str(), dst.c_str());
                                 break;
                             }
                         }
                     }
-                    closedir(udir);
+                    closedir(pdir);
                 }
 
                 real_setenv("IDAUSR", fake_idausr.c_str());
             }
+#else
+            g_block_plugins = true;
 #endif
         }
 

@@ -10,6 +10,11 @@
  *   - Queue system for processing multiple submissions
  *   - Real-time progress updates to users
  *   - DWARF debug info extraction when available
+ *   - Preserves original filenames (used by Lumina for scoring)
+ *   - Per-job isolated directories with RAII cleanup
+ *   - Subprocess timeout to prevent stuck worker slots
+ *   - Automatic expiry of abandoned jobs (PDB-wait, stale downloads)
+ *   - Startup cleanup of leftover directories from previous crashes
  */
 
 #include <td/telegram/Client.h>
@@ -32,6 +37,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -70,22 +76,24 @@ namespace std_cv {
 #include <unistd.h>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <poll.h>
+#include <signal.h>
 
 // Save functions before IDA SDK redefines them with macros
 static inline pid_t real_waitpid(pid_t pid, int* status, int options) {
     return waitpid(pid, status, options);
 }
 
-static inline char* real_fgets(char* s, int size, FILE* stream) {
-    return fgets(s, size, stream);
+static inline ssize_t real_read(int fd, void* buf, size_t count) {
+    return read(fd, buf, count);
 }
 
-static inline FILE* real_popen(const char* command, const char* type) {
-    return popen(command, type);
+static inline int real_close(int fd) {
+    return close(fd);
 }
 
-static inline int real_pclose(FILE* stream) {
-    return pclose(stream);
+static inline int real_kill(pid_t pid, int sig) {
+    return kill(pid, sig);
 }
 #endif
 
@@ -121,6 +129,8 @@ struct BotConfig {
     std::string tdlib_dir = "tdlib_bot";
     std::string ida_lumina_path = "./ida_lumina";  // Path to ida_lumina tool
     size_t max_file_size = 100 * 1024 * 1024;  // 100 MB
+    size_t analysis_timeout = 300;  // 5 minutes in seconds
+    size_t job_expiry_timeout = 600;  // 10 minutes in seconds (for abandoned PDB-wait jobs)
     bool no_plugins = true;  // Disable user plugins by default
 };
 
@@ -322,43 +332,73 @@ std::string escape_markdown(const std::string& text) {
     return result;
 }
 
-// Generate a hash string from job_id for filename anonymization
-static std::string hash_job_id(int64_t job_id) {
-    // Simple hash using job_id - produces 16 hex chars
-    uint64_t hash = static_cast<uint64_t>(job_id);
-    hash ^= hash >> 33;
-    hash *= 0xff51afd7ed558ccdULL;
-    hash ^= hash >> 33;
-    hash *= 0xc4ceb9fe1a85ec53ULL;
-    hash ^= hash >> 33;
+// Generate a unique directory name for job file isolation.
+// Uses job_id + random bits to ensure uniqueness even across restarts.
+static std::string generate_unique_id(int64_t job_id) {
+    static std::mutex rng_mutex;
+    static std::mt19937_64 rng(std::random_device{}());
+
+    uint64_t random_bits;
+    {
+        std::lock_guard<std::mutex> lock(rng_mutex);
+        random_bits = rng();
+    }
 
     std::ostringstream ss;
-    ss << std::hex << std::setfill('0') << std::setw(16) << hash;
+    ss << "job_" << job_id << "_" << std::hex << std::setfill('0') << std::setw(16) << random_bits;
     return ss.str();
 }
 
-// Extract file extension (lowercase)
-static std::string get_extension(const std::string& filename) {
-    size_t dot = filename.rfind('.');
-    if (dot == std::string::npos || dot == filename.length() - 1) {
-        return "";
+// RAII guard for per-job working directory.
+// Automatically removes the entire directory tree when the last reference is dropped.
+// This ensures cleanup on success, failure, crash, or abandoned jobs.
+struct JobDirGuard {
+    std::string dir_path;
+
+    explicit JobDirGuard(const std::string& path) : dir_path(path) {}
+    ~JobDirGuard() {
+        if (!dir_path.empty()) {
+            std::error_code ec;
+            fs::remove_all(dir_path, ec);
+            if (ec) {
+                std::cerr << "[Cleanup] Failed to remove job directory " << dir_path
+                          << ": " << ec.message() << std::endl;
+            }
+        }
     }
-    std::string ext = filename.substr(dot);
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-    return ext;
-}
+
+    // Non-copyable, movable
+    JobDirGuard(const JobDirGuard&) = delete;
+    JobDirGuard& operator=(const JobDirGuard&) = delete;
+    JobDirGuard(JobDirGuard&& other) noexcept : dir_path(std::move(other.dir_path)) {
+        other.dir_path.clear();
+    }
+    JobDirGuard& operator=(JobDirGuard&& other) noexcept {
+        if (this != &other) {
+            // Clean up current directory if any
+            if (!dir_path.empty()) {
+                std::error_code ec;
+                fs::remove_all(dir_path, ec);
+            }
+            dir_path = std::move(other.dir_path);
+            other.dir_path.clear();
+        }
+        return *this;
+    }
+};
 
 struct AnalysisJob {
     int64_t job_id;
     int64_t chat_id;
     int64_t message_id;
     int64_t status_message_id = 0;
-    std::string file_name;      // Original filename (for display only)
-    std::string file_hash;      // Hash used for actual file storage
-    std::string local_path;
+    std::string file_name;      // Original filename (preserved for Lumina scoring)
+    std::string job_dir;        // Per-job directory: work_dir/<unique_id>/
+    std::string local_path;     // job_dir/file_name — binary with original basename
     std::string pdb_path;       // Optional PDB file for PE binaries
     std::string tdlib_doc_path; // Path to tdlib downloaded doc (for cleanup)
     std::string tdlib_pdb_path; // Path to tdlib downloaded PDB (for cleanup)
+    std::shared_ptr<JobDirGuard> dir_guard;  // RAII cleanup for job_dir
     JobStatus status = JobStatus::PENDING;
     std::string error_message;
     size_t function_count = 0;
@@ -381,8 +421,15 @@ public:
         job->chat_id = chat_id;
         job->message_id = message_id;
         job->file_name = file_name;
-        job->file_hash = hash_job_id(job->job_id);
         job->created_at = std::chrono::steady_clock::now();
+
+        // Create a unique per-job directory to isolate files and preserve
+        // the original basename (used by Lumina for scoring)
+        std::string unique_id = generate_unique_id(job->job_id);
+        job->job_dir = g_config.work_dir + "/" + unique_id;
+        fs::create_directories(job->job_dir);
+        job->dir_guard = std::make_shared<JobDirGuard>(job->job_dir);
+
         m_jobs[job->job_id] = job;
         return job->job_id;
     }
@@ -471,21 +518,16 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         auto it = m_jobs.find(job_id);
         if (it != m_jobs.end()) {
-            // Clean up work directory files
+            // Clean up tdlib downloaded documents (outside our job directory)
             std::error_code ec;
-            if (!it->second->local_path.empty()) {
-                fs::remove(it->second->local_path, ec);
-            }
-            if (!it->second->pdb_path.empty()) {
-                fs::remove(it->second->pdb_path, ec);
-            }
-            // Clean up tdlib downloaded documents
             if (!it->second->tdlib_doc_path.empty()) {
                 fs::remove(it->second->tdlib_doc_path, ec);
             }
             if (!it->second->tdlib_pdb_path.empty()) {
                 fs::remove(it->second->tdlib_pdb_path, ec);
             }
+            // Erase job from map — the shared_ptr<JobDirGuard> destructor
+            // will automatically remove the per-job directory and all files in it
             m_jobs.erase(it);
         }
     }
@@ -520,6 +562,59 @@ private:
 
 hexdsp_t *hexdsp = nullptr;
 
+#ifndef _WIN32
+// RAII guard for a child subprocess + pipe.
+// Ensures the child is killed and reaped, and the pipe FD is closed,
+// no matter how the scope exits (normal return, exception, etc.).
+struct SubprocessGuard {
+    pid_t child_pid = -1;
+    int pipe_fd = -1;
+
+    SubprocessGuard() = default;
+    ~SubprocessGuard() {
+        close_pipe();
+        kill_and_reap();
+    }
+
+    void close_pipe() {
+        if (pipe_fd >= 0) {
+            real_close(pipe_fd);
+            pipe_fd = -1;
+        }
+    }
+
+    void kill_and_reap() {
+        if (child_pid > 0) {
+            // Check if already exited
+            int status = 0;
+            pid_t result = real_waitpid(child_pid, &status, WNOHANG);
+            if (result == 0) {
+                // Still running — send SIGTERM
+                real_kill(child_pid, SIGTERM);
+
+                // Wait up to 5 seconds for graceful exit
+                for (int i = 0; i < 50; i++) {
+                    result = real_waitpid(child_pid, &status, WNOHANG);
+                    if (result != 0) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+
+                if (result == 0) {
+                    // Still alive — SIGKILL
+                    real_kill(child_pid, SIGKILL);
+                    real_waitpid(child_pid, &status, 0);
+                }
+            }
+            child_pid = -1;
+        }
+    }
+
+    // Non-copyable
+    SubprocessGuard(const SubprocessGuard&) = delete;
+    SubprocessGuard& operator=(const SubprocessGuard&) = delete;
+};
+#endif
+
 class AnalysisWorker {
 public:
     using StatusCallback = std::function<void(int64_t job_id, JobStatus status, const std::string& detail)>;
@@ -553,8 +648,23 @@ private:
                 continue;
             }
 
-            std::cout << "[Worker " << worker_id << "] Processing job " << job->job_id << ": " << job->file_name << std::endl;
-            process_job_in_subprocess(job);
+            std::cout << "[Worker " << worker_id << "] Processing job " << job->job_id
+                      << ": " << job->file_name << std::endl;
+
+            try {
+                process_job_in_subprocess(job);
+            } catch (const std::exception& e) {
+                std::cerr << "[Worker " << worker_id << "] Exception processing job "
+                          << job->job_id << ": " << e.what() << std::endl;
+                job->error_message = std::string("Internal error: ") + e.what();
+                m_status_callback(job->job_id, JobStatus::FAILED, job->error_message);
+            } catch (...) {
+                std::cerr << "[Worker " << worker_id << "] Unknown exception processing job "
+                          << job->job_id << std::endl;
+                job->error_message = "Internal error: unknown exception";
+                m_status_callback(job->job_id, JobStatus::FAILED, job->error_message);
+            }
+
             std::cout << "[Worker " << worker_id << "] Job " << job->job_id << " finished" << std::endl;
         }
         std::cout << "[Worker " << worker_id << "] Exiting" << std::endl;
@@ -563,33 +673,175 @@ private:
     void process_job_in_subprocess(std::shared_ptr<AnalysisJob> job) {
         m_status_callback(job->job_id, JobStatus::ANALYZING, "");
 
-        // Build command to run ida_lumina as a separate process
-        // This avoids fork() issues with multi-threaded TDLib
+#ifdef _WIN32
+        // Windows: use popen (no fork available)
+        // TODO: implement CreateProcess with timeout for Windows
         std::string cmd = g_config.ida_lumina_path;
         if (g_config.no_plugins) {
             cmd += " --no-plugins";
         }
         cmd += " \"" + job->local_path + "\" 2>&1";
-
         std::cout << "[Worker] Running: " << cmd << std::endl;
 
-        FILE* pipe = real_popen(cmd.c_str(), "r");
+        // Fallback to popen on Windows (no timeout support yet)
+        FILE* pipe = _popen(cmd.c_str(), "r");
         if (!pipe) {
             job->error_message = "Failed to launch ida_lumina";
             m_status_callback(job->job_id, JobStatus::FAILED, job->error_message);
             return;
         }
-
-        // Read and parse output
         std::string output;
         char buffer[256];
-        while (real_fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
             output += buffer;
-            std::cout << "[ida_lumina] " << buffer;
+        }
+        int exit_code = _pclose(pipe);
+        bool success = (exit_code == 0);
+        bool timed_out = false;
+#else
+        // Unix: use fork/exec with pipe and timeout via poll()
+
+        // Build argv for execvp
+        std::vector<std::string> args;
+        args.push_back(g_config.ida_lumina_path);
+        if (g_config.no_plugins) {
+            args.push_back("--no-plugins");
+        }
+        args.push_back(job->local_path);
+
+        std::vector<char*> argv;
+        for (auto& a : args) {
+            argv.push_back(const_cast<char*>(a.c_str()));
+        }
+        argv.push_back(nullptr);
+
+        std::cout << "[Worker] Running:";
+        for (const auto& a : args) std::cout << " " << a;
+        std::cout << std::endl;
+
+        // Create pipe for capturing stdout+stderr
+        int pipe_fds[2];
+        if (pipe(pipe_fds) != 0) {
+            job->error_message = "Failed to create pipe";
+            m_status_callback(job->job_id, JobStatus::FAILED, job->error_message);
+            return;
         }
 
-        int exit_code = real_pclose(pipe);
-        bool success = (WIFEXITED(exit_code) && WEXITSTATUS(exit_code) == 0);
+        // RAII guard takes ownership of the read end + child PID
+        SubprocessGuard guard;
+        guard.pipe_fd = pipe_fds[0];  // read end
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            real_close(pipe_fds[1]);  // close write end
+            job->error_message = "Failed to fork subprocess";
+            m_status_callback(job->job_id, JobStatus::FAILED, job->error_message);
+            return;
+        }
+
+        if (pid == 0) {
+            // Child process
+            real_close(pipe_fds[0]);  // close read end
+
+            // Redirect stdout and stderr to pipe write end
+            dup2(pipe_fds[1], STDOUT_FILENO);
+            dup2(pipe_fds[1], STDERR_FILENO);
+            real_close(pipe_fds[1]);
+
+            // Set working directory to the job's directory so IDA creates
+            // its temp files there (and they get cleaned up with the job dir)
+            if (chdir(job->job_dir.c_str()) != 0) {
+                _exit(127);
+            }
+
+            execvp(argv[0], argv.data());
+            // If execvp returns, it failed
+            _exit(127);
+        }
+
+        // Parent process
+        real_close(pipe_fds[1]);  // close write end
+        guard.child_pid = pid;
+
+        // Read output with timeout using poll()
+        std::string output;
+        bool timed_out = false;
+        auto deadline = std::chrono::steady_clock::now()
+                      + std::chrono::seconds(g_config.analysis_timeout);
+
+        // Set pipe to non-blocking isn't needed with poll() —
+        // poll() tells us when data is available, then read() won't block
+        while (true) {
+            auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                timed_out = true;
+                std::cout << "[Worker] Job " << job->job_id << " timed out after "
+                          << g_config.analysis_timeout << " seconds" << std::endl;
+                break;
+            }
+
+            auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now).count();
+            // Clamp to reasonable poll interval (check every 1 second at most)
+            int poll_timeout = static_cast<int>(std::min(remaining_ms, (long long)1000));
+
+            struct pollfd pfd;
+            pfd.fd = guard.pipe_fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+
+            int poll_result = poll(&pfd, 1, poll_timeout);
+            if (poll_result < 0) {
+                if (errno == EINTR) continue;
+                break;  // poll error
+            }
+
+            if (poll_result == 0) {
+                // Timeout on this poll iteration — check deadline
+                continue;
+            }
+
+            if (pfd.revents & (POLLIN | POLLHUP)) {
+                char buffer[4096];
+                ssize_t n = real_read(guard.pipe_fd, buffer, sizeof(buffer));
+                if (n <= 0) {
+                    break;  // EOF or error — child closed its end
+                }
+                output.append(buffer, n);
+            }
+
+            if (pfd.revents & (POLLERR | POLLNVAL)) {
+                break;
+            }
+        }
+
+        // Close pipe before waiting — we've read everything or timed out
+        guard.close_pipe();
+
+        if (timed_out) {
+            // Kill the child process (SubprocessGuard handles SIGTERM → SIGKILL escalation)
+            guard.kill_and_reap();
+
+            job->error_message = "Analysis timed out after "
+                + std::to_string(g_config.analysis_timeout) + " seconds";
+            m_status_callback(job->job_id, JobStatus::FAILED, job->error_message);
+            return;
+        }
+
+        // Wait for child to exit
+        int status = 0;
+        real_waitpid(pid, &status, 0);
+        guard.child_pid = -1;  // Already reaped, don't kill in destructor
+
+        bool success = (WIFEXITED(status) && WEXITSTATUS(status) == 0);
+#endif
+
+        // Log captured output
+        if (!output.empty()) {
+            std::cout << "[ida_lumina output for job " << job->job_id << "]" << std::endl;
+            std::cout << output;
+            if (output.back() != '\n') std::cout << std::endl;
+        }
 
         // Parse stats from output
         PushStats stats = {};
@@ -608,8 +860,23 @@ private:
                 error_msg = output.substr(pos + 8, end - pos - 8);
             } else if (output.find("Failed to connect to Lumina") != std::string::npos) {
                 error_msg = "Failed to connect to Lumina server";
+#ifndef _WIN32
+            } else if (timed_out) {
+                error_msg = "Analysis timed out after "
+                    + std::to_string(g_config.analysis_timeout) + " seconds";
+#endif
             } else {
-                error_msg = "Analysis failed (exit code " + std::to_string(WEXITSTATUS(exit_code)) + ")";
+#ifdef _WIN32
+                error_msg = "Analysis failed (exit code " + std::to_string(exit_code) + ")";
+#else
+                if (WIFEXITED(status)) {
+                    error_msg = "Analysis failed (exit code " + std::to_string(WEXITSTATUS(status)) + ")";
+                } else if (WIFSIGNALED(status)) {
+                    error_msg = "Analysis killed by signal " + std::to_string(WTERMSIG(status));
+                } else {
+                    error_msg = "Analysis failed (unknown status)";
+                }
+#endif
             }
             job->error_message = error_msg;
             m_status_callback(job->job_id, JobStatus::FAILED, error_msg);
@@ -744,6 +1011,10 @@ public:
         // Create work directory
         fs::create_directories(g_config.work_dir);
 
+        // Clean up leftover job directories from previous runs/crashes.
+        // Any directory matching "job_*" in work_dir is a stale remnant.
+        cleanup_stale_job_dirs();
+
         // Initialize TDLib
         td::ClientManager::execute(td_api::make_object<td_api::setLogVerbosityLevel>(1));
         m_client_manager = std::make_unique<td::ClientManager>();
@@ -754,14 +1025,23 @@ public:
     void run() {
         m_worker.start();
 
+        auto last_expiry_check = std::chrono::steady_clock::now();
+
         while (!m_need_quit) {
             auto response = m_client_manager->receive(1.0);
             if (response.object) {
                 process_response(std::move(response));
             }
 
-            // Process any pending status updates
+            // Process any pending status updates from worker threads
             process_pending_updates();
+
+            // Periodically check for expired/abandoned jobs (every 10 seconds)
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_expiry_check >= std::chrono::seconds(10)) {
+                check_expired_jobs();
+                last_expiry_check = now;
+            }
         }
 
         m_worker.stop();
@@ -1092,9 +1372,9 @@ private:
 
         std::cout << "[Bot] Processing job " << job_id << " for file " << job->file_name << std::endl;
 
-        // Move file to work directory with hashed filename
-        std::string ext = get_extension(job->file_name);
-        std::string dest_path = g_config.work_dir + "/" + job->file_hash + ext;
+        // Copy file to per-job directory, preserving the original basename
+        // (Lumina uses the basename for scoring)
+        std::string dest_path = job->job_dir + "/" + job->file_name;
         std::cout << "[Bot] Copying " << local_path << " to " << dest_path << std::endl;
         try {
             fs::copy_file(local_path, dest_path, fs::copy_options::overwrite_existing);
@@ -1103,8 +1383,12 @@ private:
             std::cout << "[Bot] Copy successful" << std::endl;
         } catch (const std::exception& e) {
             std::cout << "[Bot] Copy failed: " << e.what() << std::endl;
-            update_status_message(job, "Download failed: " + std::string(e.what()));
+            std::string err_text = status_emoji(JobStatus::FAILED)
+                + " *File copy failed*\n\n"
+                + "Error: " + escape_markdown(e.what());
+            update_status_message(job, err_text);
             m_job_queue.update_status(job_id, JobStatus::FAILED, e.what());
+            m_job_queue.remove_job(job_id);
             return;
         }
 
@@ -1161,9 +1445,16 @@ private:
     void on_pdb_download_complete(std::shared_ptr<AnalysisJob> job, const std::string& local_path) {
         std::cout << "[Bot] PDB download complete for job " << job->job_id << std::endl;
 
-        // Copy PDB to work directory with hashed filename
-        // Use same hash as binary so IDA finds it automatically
-        std::string pdb_dest = g_config.work_dir + "/" + job->file_hash + ".pdb";
+        // Copy PDB to per-job directory alongside the binary.
+        // IDA looks for PDB files in the same directory as the binary,
+        // so placing it in job_dir ensures automatic discovery.
+        std::string pdb_filename = fs::path(local_path).filename().string();
+        if (pdb_filename.empty()) {
+            // Fallback: derive PDB name from binary name
+            std::string base = fs::path(job->file_name).stem().string();
+            pdb_filename = base + ".pdb";
+        }
+        std::string pdb_dest = job->job_dir + "/" + pdb_filename;
 
         try {
             fs::copy_file(local_path, pdb_dest, fs::copy_options::overwrite_existing);
@@ -1323,6 +1614,103 @@ private:
         });
     }
 
+    // Clean up leftover job directories from a previous run/crash.
+    // Called once during startup. Any directory in work_dir starting with "job_"
+    // is a stale remnant that was not properly cleaned up.
+    void cleanup_stale_job_dirs() {
+        std::error_code ec;
+        if (!fs::exists(g_config.work_dir)) return;
+
+        size_t cleaned = 0;
+        for (const auto& entry : fs::directory_iterator(g_config.work_dir, ec)) {
+            if (!entry.is_directory()) continue;
+            std::string name = entry.path().filename().string();
+            if (name.rfind("job_", 0) == 0) {
+                std::error_code rm_ec;
+                fs::remove_all(entry.path(), rm_ec);
+                if (!rm_ec) {
+                    cleaned++;
+                } else {
+                    std::cerr << "[Cleanup] Failed to remove stale directory " << entry.path()
+                              << ": " << rm_ec.message() << std::endl;
+                }
+            }
+        }
+        if (cleaned > 0) {
+            std::cout << "[Cleanup] Removed " << cleaned << " stale job directories from previous run" << std::endl;
+        }
+    }
+
+    // Check for and expire abandoned jobs:
+    //  - Jobs in DOWNLOADING state for longer than job_expiry_timeout
+    //  - Jobs waiting for PDB (waiting_for_pdb == true) for longer than job_expiry_timeout
+    //  - Jobs stuck in PENDING state for longer than job_expiry_timeout
+    // Called periodically from the main event loop.
+    void check_expired_jobs() {
+        auto now = std::chrono::steady_clock::now();
+        auto expiry_duration = std::chrono::seconds(g_config.job_expiry_timeout);
+
+        // Collect expired jobs while holding the lock, then process outside
+        std::vector<std::pair<int64_t, std::string>> expired_jobs;  // job_id, reason
+        {
+            std::lock_guard<std::mutex> lock(m_job_queue.get_mutex());
+            for (auto& [id, job] : m_job_queue.get_jobs()) {
+                auto age = now - job->created_at;
+                if (age < expiry_duration) continue;
+
+                bool should_expire = false;
+                std::string reason;
+
+                if (job->waiting_for_pdb) {
+                    should_expire = true;
+                    reason = "Timed out waiting for PDB file";
+                } else if (job->status == JobStatus::DOWNLOADING) {
+                    should_expire = true;
+                    reason = "Download timed out";
+                } else if (job->status == JobStatus::PENDING) {
+                    should_expire = true;
+                    reason = "Job expired while pending";
+                } else if (job->status == JobStatus::FAILED || job->status == JobStatus::COMPLETED) {
+                    // Jobs that reached terminal state but weren't cleaned up
+                    // (e.g., failed during download phase, before entering worker queue)
+                    should_expire = true;
+                    reason = job->error_message.empty() ? "Stale job" : job->error_message;
+                }
+
+                if (should_expire) {
+                    expired_jobs.push_back({id, reason});
+                }
+            }
+        }
+
+        // Process expired jobs (outside the lock to avoid deadlock with status callbacks)
+        for (const auto& [job_id, reason] : expired_jobs) {
+            auto job = m_job_queue.get_job(job_id);
+            if (!job) continue;
+
+            bool was_already_terminal = (job->status == JobStatus::FAILED || job->status == JobStatus::COMPLETED);
+
+            std::cout << "[Expiry] Job " << job_id << " expired: " << reason << std::endl;
+
+            job->status = JobStatus::FAILED;
+            job->error_message = reason;
+            job->waiting_for_pdb = false;
+
+            // Only notify user if the job wasn't already in a terminal state
+            // (avoids duplicate messages for jobs that failed during download)
+            if (!was_already_terminal) {
+                std::ostringstream ss;
+                ss << status_emoji(JobStatus::COMPLETED) << " *File:* `" << escape_markdown(job->file_name) << "`\n";
+                ss << status_emoji(JobStatus::FAILED) << " *Expired*\n\n";
+                ss << "Reason: " << escape_markdown(reason);
+                update_status_message(job, ss.str());
+            }
+
+            // Clean up the job (triggers RAII directory removal)
+            m_job_queue.remove_job(job_id);
+        }
+    }
+
     std::uint64_t next_query_id() {
         return ++m_current_query_id;
     }
@@ -1361,6 +1749,8 @@ void print_usage(const char* prog) {
     std::cout << "  --tdlib-dir <path>  TDLib database directory (default: tdlib_bot)\n";
     std::cout << "  --ida-lumina <path> Path to ida_lumina tool (default: ./ida_lumina)\n";
     std::cout << "  --max-size <mb>     Maximum file size in MB (default: 100)\n";
+    std::cout << "  --timeout <secs>    Analysis timeout in seconds (default: 300)\n";
+    std::cout << "  --expiry <secs>     Job expiry timeout for abandoned jobs (default: 600)\n";
     std::cout << "  --no-plugins        Disable loading user plugins (default)\n";
     std::cout << "  --plugins           Enable loading user plugins\n";
     std::cout << "  -h, --help          Show this help\n";
@@ -1405,6 +1795,10 @@ bool parse_args(int argc, char* argv[]) {
             g_config.max_file_size = std::stoull(argv[++i]) * 1024 * 1024;
         } else if (arg == "--ida-lumina" && i + 1 < argc) {
             g_config.ida_lumina_path = argv[++i];
+        } else if (arg == "--timeout" && i + 1 < argc) {
+            g_config.analysis_timeout = std::stoull(argv[++i]);
+        } else if (arg == "--expiry" && i + 1 < argc) {
+            g_config.job_expiry_timeout = std::stoull(argv[++i]);
         } else if (arg == "--no-plugins") {
             g_config.no_plugins = true;
         } else if (arg == "--plugins") {
@@ -1442,6 +1836,8 @@ int main(int argc, char* argv[]) {
     std::cout << "Work directory: " << g_config.work_dir << "\n";
     std::cout << "ida_lumina path: " << g_config.ida_lumina_path << "\n";
     std::cout << "Max file size: " << (g_config.max_file_size / (1024 * 1024)) << " MB\n";
+    std::cout << "Analysis timeout: " << g_config.analysis_timeout << " seconds\n";
+    std::cout << "Job expiry timeout: " << g_config.job_expiry_timeout << " seconds\n";
     std::cout << "No plugins: " << (g_config.no_plugins ? "yes" : "no") << "\n";
 
     try {
