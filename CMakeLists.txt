@@ -99,6 +99,27 @@ target_compile_features(ida_lumina PRIVATE cxx_std_17)
 if(NOT WIN32)
     target_link_libraries(ida_lumina PRIVATE dl)
 endif()
+if(APPLE)
+    target_link_options(ida_lumina PRIVATE -Wl,-flat_namespace)
+endif()
+
+# Lumina metadata debug tool
+ida_add_idalib(ida_lumina_debug
+  TYPE EXECUTABLE
+  SOURCES
+    src/lumina_debug.cpp
+    src/noplugins.c
+  INCLUDES
+    ${CMAKE_CURRENT_LIST_DIR}/vendor/kat/include
+)
+
+target_compile_features(ida_lumina_debug PRIVATE cxx_std_17)
+if(NOT WIN32)
+    target_link_libraries(ida_lumina_debug PRIVATE dl)
+endif()
+if(APPLE)
+    target_link_options(ida_lumina_debug PRIVATE -Wl,-flat_namespace)
+endif()
 
 # Telegram Lumina Bot (optional, requires TDLib, Linux only)
 option(BUILD_LUMINA_BOT "Build the Telegram Lumina bot (requires TDLib)" OFF)
@@ -127,4 +148,3 @@ if(BUILD_LUMINA_BOT AND NOT WIN32)
 elseif(BUILD_LUMINA_BOT AND WIN32)
     message(STATUS "Skipping lumina_bot on Windows (TDLib not supported)")
 endif()
-

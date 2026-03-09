@@ -4,7 +4,8 @@ A headless IDA Pro toolset for binary analysis. Built on top of `idalib`, it run
 
 1. **ida_dump** - Extracts assembly, microcode, and Hex-Rays pseudocode from binaries
 2. **ida_lumina** - Pushes function metadata to Hex-Rays' Lumina server
-3. **lumina_bot** - Telegram bot for crowdsourced Lumina symbol submission (optional)
+3. **ida_lumina_debug** - Dumps per-function Lumina hashes and metadata summaries
+4. **lumina_bot** - Telegram bot for crowdsourced Lumina symbol submission (optional)
 
 ## Features
 
@@ -15,7 +16,7 @@ A headless IDA Pro toolset for binary analysis. Built on top of `idalib`, it run
 - **File output**: Write to file with real-time progress display
 - **Error detection**: Find decompilation failures across a binary
 - **Plugin control**: Disable user plugins or selectively enable specific ones
-- **Lumina integration**: Push function metadata to Hex-Rays' Lumina server
+- **Lumina integration**: Push function metadata to Hex-Rays' Lumina server or inspect the local metadata that would be hashed
 
 ## Requirements
 
@@ -39,7 +40,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-Outputs: `build/ida_dump` and `build/ida_lumina`
+Outputs: `build/ida_dump`, `build/ida_lumina`, and `build/ida_lumina_debug`
 
 ### Building the Telegram Bot (optional, Linux only)
 
@@ -173,6 +174,52 @@ ida_lumina --plugin dazhbog program.exe
 ```
 
 **Note**: Lumina credentials must be configured in IDA Pro settings. The tool uses IDA's existing Lumina configuration.
+
+## ida_lumina_debug Usage
+
+```
+ida_lumina_debug [options] <binary_file>
+```
+
+Analyzes a binary and dumps per-function Lumina-relevant metadata such as the calculated function MD5, EA/RVA, names, and a metadata-key/presence summary.
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `--csv` | Emit CSV instead of human-readable text |
+| `--bytes` | Include hex-encoded function bytes, total byte length, and chunk ranges from IDA |
+| `-o, --output <file>` | Write output to a file |
+| `-f, --filter <pattern>` | Filter functions by name (regex or substring) |
+| `-F, --functions <list>` | Comma or pipe-separated list of function names/addresses |
+| `-a, --address <hex>` | Dump only the function at a specific address |
+| `-q, --quiet` | Suppress IDA's verbose messages |
+| `-v, --verbose` | Show extra name detail in text mode |
+| `--no-color` | Disable colored output |
+| `--no-plugins` | Don't load user plugins |
+| `--plugin <pattern>` | Load plugins matching pattern (implies `--no-plugins`) |
+
+### Examples
+
+```bash
+# Human-readable Lumina metadata dump
+ida_lumina_debug program.exe
+
+# CSV to stdout
+ida_lumina_debug --csv program.exe
+
+# Include function bytes in the output
+ida_lumina_debug --bytes program.exe
+
+# CSV to a file
+ida_lumina_debug --csv -o lumina.csv program.exe
+
+# Focus on one function by name
+ida_lumina_debug -f main program.exe
+
+# Focus on explicit names/addresses
+ida_lumina_debug -F "main,parse_config,0x140001000" program.exe
+```
 
 ## Output Format
 
