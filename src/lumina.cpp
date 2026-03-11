@@ -19,9 +19,11 @@
 #include <cctype>
 #include <cstring>
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -29,6 +31,7 @@
 #else
 #include <dlfcn.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <dirent.h>
 #endif
@@ -45,6 +48,32 @@ static inline int real_setenv(const char* name, const char* value) {
 static inline const char* real_getenv(const char* name) {
     return getenv(name);
 }
+
+#ifndef _WIN32
+static inline pid_t real_waitpid(pid_t pid, int* status, int options) {
+    return waitpid(pid, status, options);
+}
+
+static inline ssize_t real_read(int fd, void* buf, size_t count) {
+    return read(fd, buf, count);
+}
+
+static inline ssize_t real_write(int fd, const void* buf, size_t count) {
+    return write(fd, buf, count);
+}
+
+static inline int real_close(int fd) {
+    return close(fd);
+}
+
+static inline int real_pipe(int pipefd[2]) {
+    return pipe(pipefd);
+}
+
+static inline pid_t real_fork() {
+    return fork();
+}
+#endif
 
 // From noplugins.c - controls plugin blocking
 extern "C" bool g_block_plugins;
@@ -75,7 +104,10 @@ struct Options {
     std::string input_file;
     bool quiet = false;
     bool no_plugins = false;
+    bool recursive = false;
     bool verbose = false;
+    unsigned int jobs = 0;
+    bool jobs_specified = false;
     std::vector<std::string> plugin_patterns;  // Additional plugins to load in no-plugins mode
 };
 
@@ -134,6 +166,40 @@ struct PushStats {
     size_t exists = 0;
     size_t error = 0;
 };
+
+struct FileRunResult {
+    size_t function_count = 0;
+    PushStats stats;
+    bool success = false;
+    std::string error_message;
+};
+
+#ifndef _WIN32
+constexpr size_t CHILD_ERROR_MESSAGE_SIZE = 512;
+
+struct ChildRunMessage {
+    uint64_t total = 0;
+    uint64_t skip = 0;
+    uint64_t new_count = 0;
+    uint64_t exists = 0;
+    uint64_t error = 0;
+    uint8_t success = 0;
+    char error_message[CHILD_ERROR_MESSAGE_SIZE] = {};
+};
+
+struct WorkerProcess {
+    pid_t pid = -1;
+    int read_fd = -1;
+    std::string input_file;
+};
+
+struct BatchRunStats {
+    size_t files_total = 0;
+    size_t files_succeeded = 0;
+    size_t files_failed = 0;
+    PushStats lumina;
+};
+#endif
 
 class LuminaConnection {
 private:
@@ -224,16 +290,26 @@ public:
      *   +0x08: count
      *   +0x18: pointer to result code array (uint32 per entry)
      */
-    bool push_all(PushStats& stats) {
+    bool push_all(PushStats& stats, std::string* error_message = nullptr, bool emit_output = true) {
         if (!is_connected()) {
-            std::cerr << CLR(Red) << "[-] Not connected to Lumina" << CLR(Reset) << "\n";
+            if (error_message) {
+                *error_message = "Not connected to Lumina";
+            }
+            if (emit_output) {
+                std::cerr << CLR(Red) << "[-] Not connected to Lumina" << CLR(Reset) << "\n";
+            }
             return false;
         }
 
         // Get push_metadata method from vtable
         void* push_method = get_push_metadata_method();
         if (!push_method) {
-            std::cerr << CLR(Red) << "[-] Failed to get push_metadata method" << CLR(Reset) << "\n";
+            if (error_message) {
+                *error_message = "Failed to get push_metadata method";
+            }
+            if (emit_output) {
+                std::cerr << CLR(Red) << "[-] Failed to get push_metadata method" << CLR(Reset) << "\n";
+            }
             return false;
         }
 
@@ -264,7 +340,7 @@ public:
         } error_out = {};
 
         // Call push_metadata
-        if (g_opts.verbose) {
+        if (emit_output && g_opts.verbose) {
             std::cout << "[*] Calling push_metadata..." << std::endl;
         }
 
@@ -290,7 +366,12 @@ public:
         // Check for error
         if (error_out.has_error && error_out.str_ptr) {
             const char* err_str = static_cast<const char*>(error_out.str_ptr);
-            std::cerr << CLR(Red) << "[-] Lumina error: " << err_str << CLR(Reset) << "\n";
+            if (error_message) {
+                *error_message = err_str;
+            }
+            if (emit_output) {
+                std::cerr << CLR(Red) << "[-] Lumina error: " << err_str << CLR(Reset) << "\n";
+            }
             return false;
         }
 
@@ -304,7 +385,7 @@ public:
 
 class HeadlessIdaContext {
 public:
-    HeadlessIdaContext(const char *input_file) {
+    HeadlessIdaContext(const char *input_file, bool quiet_mode) {
         if (g_opts.no_plugins) {
 #ifndef _WIN32
             const char* idadir_env = real_getenv("IDADIR");
@@ -433,17 +514,17 @@ public:
             throw std::runtime_error("Failed to initialize IDA library.");
         }
 
-        enable_console_messages(!g_opts.quiet);
+        enable_console_messages(!quiet_mode);
 
         if (open_database(input_file, true) != 0) {
             throw std::runtime_error(std::string("Failed to open: ") + input_file);
         }
 
-        if (!g_opts.quiet) {
+        if (!quiet_mode) {
             std::cout << "[*] Waiting for auto-analysis..." << std::endl;
         }
         auto_wait();
-        if (!g_opts.quiet) {
+        if (!quiet_mode) {
             std::cout << "[*] Analysis complete." << std::endl;
         }
 
@@ -481,14 +562,385 @@ private:
 // Usage
 //=============================================================================
 
+static unsigned int default_job_count() {
+#ifdef _WIN32
+    SYSTEM_INFO info = {};
+    GetSystemInfo(&info);
+    return info.dwNumberOfProcessors == 0 ? 1u : info.dwNumberOfProcessors;
+#else
+    long count = sysconf(_SC_NPROCESSORS_ONLN);
+    return count > 0 ? static_cast<unsigned int>(count) : 1u;
+#endif
+}
+
+static bool parse_positive_uint(const std::string& value, unsigned int& parsed) {
+    try {
+        size_t consumed = 0;
+        unsigned long number = std::stoul(value, &consumed, 10);
+        if (consumed != value.size() ||
+            number == 0 ||
+            number > std::numeric_limits<unsigned int>::max()) {
+            return false;
+        }
+        parsed = static_cast<unsigned int>(number);
+        return true;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+static void print_run_results(const FileRunResult& result) {
+    std::cout << "\n";
+    std::cout << CLR(Bold) << "Results" << CLR(Reset) << "\n";
+    std::cout << std::string(50, '-') << "\n";
+    std::cout << "  Total processed: " << result.stats.total << "\n";
+    std::cout << "  " << CLR(Green) << "New:      " << result.stats.new_count << CLR(Reset) << "\n";
+    std::cout << "  " << CLR(Cyan) << "Exists:   " << result.stats.exists << CLR(Reset) << "\n";
+    std::cout << "  " << CLR(Dim) << "Skipped:  " << result.stats.skip << CLR(Reset) << "\n";
+    if (result.stats.error > 0) {
+        std::cout << "  " << CLR(Red) << "Errors:   " << result.stats.error << CLR(Reset) << "\n";
+    }
+    std::cout << std::string(50, '-') << "\n";
+
+    if (result.success) {
+        std::cout << CLR(Green) << "[+] Lumina push completed successfully" << CLR(Reset) << "\n";
+    }
+    else {
+        std::cout << CLR(Yellow) << "[!] Lumina push completed with issues" << CLR(Reset) << "\n";
+    }
+}
+
+static FileRunResult run_single_file(const std::string& input_file, bool emit_output) {
+    FileRunResult result;
+    HeadlessIdaContext ctx(input_file.c_str(), emit_output ? g_opts.quiet : true);
+
+    result.function_count = get_func_qty();
+
+    if (emit_output && !g_opts.quiet) {
+        std::cout << "\n";
+        std::cout << CLR(Bold) << "Lumina Push" << CLR(Reset) << "\n";
+        std::cout << std::string(50, '-') << "\n";
+        std::cout << "  Functions: " << result.function_count << "\n";
+        std::cout << "\n";
+    }
+
+    if (emit_output) {
+        std::cout << "[*] Connecting to Lumina server..." << std::endl;
+    }
+
+    LuminaConnection lumina;
+    if (!lumina.connect(0)) {
+        throw std::runtime_error("Failed to connect to Lumina server. Make sure Lumina is configured in IDA settings.");
+    }
+
+    if (emit_output) {
+        std::cout << CLR(Green) << "[+] Connected to Lumina" << CLR(Reset) << "\n";
+        std::cout << "[*] Pushing function metadata to Lumina..." << std::endl;
+    }
+
+    result.success = lumina.push_all(result.stats, &result.error_message, emit_output);
+
+    if (emit_output) {
+        print_run_results(result);
+        if (!g_opts.quiet) {
+            std::cout << "[*] Done.\n";
+        }
+    }
+
+    return result;
+}
+
+#ifndef _WIN32
+static bool write_full(int fd, const void* data, size_t size) {
+    const uint8_t* ptr = static_cast<const uint8_t*>(data);
+    size_t remaining = size;
+
+    while (remaining > 0) {
+        ssize_t written = real_write(fd, ptr, remaining);
+        if (written <= 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        ptr += written;
+        remaining -= static_cast<size_t>(written);
+    }
+
+    return true;
+}
+
+static bool read_full(int fd, void* data, size_t size) {
+    uint8_t* ptr = static_cast<uint8_t*>(data);
+    size_t remaining = size;
+
+    while (remaining > 0) {
+        ssize_t nread = real_read(fd, ptr, remaining);
+        if (nread == 0) {
+            return false;
+        }
+        if (nread < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        ptr += nread;
+        remaining -= static_cast<size_t>(nread);
+    }
+
+    return true;
+}
+
+static void set_child_error_message(ChildRunMessage& message, const std::string& error_text) {
+    const size_t copy_size = std::min(error_text.size(), sizeof(message.error_message) - 1);
+    std::memcpy(message.error_message, error_text.data(), copy_size);
+    message.error_message[copy_size] = '\0';
+}
+
+static ChildRunMessage make_child_message(const FileRunResult& result) {
+    ChildRunMessage message = {};
+    message.total = result.stats.total;
+    message.skip = result.stats.skip;
+    message.new_count = result.stats.new_count;
+    message.exists = result.stats.exists;
+    message.error = result.stats.error;
+    message.success = result.success ? 1 : 0;
+
+    if (!result.error_message.empty()) {
+        set_child_error_message(message, result.error_message);
+    }
+
+    return message;
+}
+
+static std::string wait_status_message(int status) {
+    if (WIFEXITED(status)) {
+        return "worker exited with status " + std::to_string(WEXITSTATUS(status));
+    }
+    if (WIFSIGNALED(status)) {
+        return "worker terminated by signal " + std::to_string(WTERMSIG(status));
+    }
+    return "worker terminated unexpectedly";
+}
+
+static std::vector<std::string> collect_recursive_inputs(const std::string& root_dir) {
+    std::filesystem::path root_path(root_dir);
+    std::error_code ec;
+
+    if (!std::filesystem::exists(root_path, ec) || ec) {
+        throw std::runtime_error("Input path does not exist: " + root_dir);
+    }
+    if (!std::filesystem::is_directory(root_path, ec) || ec) {
+        throw std::runtime_error("Recursive mode requires a directory input: " + root_dir);
+    }
+
+    std::vector<std::string> files;
+    const auto options = std::filesystem::directory_options::skip_permission_denied;
+    std::filesystem::recursive_directory_iterator end;
+    std::filesystem::recursive_directory_iterator it(root_path, options, ec);
+    if (ec) {
+        throw std::runtime_error("Failed to scan directory: " + root_dir + ": " + ec.message());
+    }
+
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+
+        std::error_code status_ec;
+        if (it->is_regular_file(status_ec) && !status_ec) {
+            files.push_back(it->path().string());
+        }
+    }
+
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+static int run_recursive_mode() {
+    const std::vector<std::string> files = collect_recursive_inputs(g_opts.input_file);
+    if (files.empty()) {
+        std::cerr << CLR(Yellow) << "[!] No regular files found under " << g_opts.input_file << CLR(Reset) << "\n";
+        return EXIT_FAILURE;
+    }
+
+    const unsigned int requested_jobs = g_opts.jobs_specified ? g_opts.jobs : default_job_count();
+    const size_t max_jobs = std::max<size_t>(1, std::min<size_t>(requested_jobs, files.size()));
+
+    std::cout << "[*] Found " << files.size() << " files under " << g_opts.input_file
+              << "; running up to " << max_jobs << " worker processes." << std::endl;
+
+    BatchRunStats batch;
+    batch.files_total = files.size();
+
+    std::vector<WorkerProcess> running;
+    size_t next_index = 0;
+    bool scheduling_failed = false;
+    std::string scheduling_error;
+
+    while ((next_index < files.size() && !scheduling_failed) || !running.empty()) {
+        while (!scheduling_failed && running.size() < max_jobs && next_index < files.size()) {
+            int pipefd[2] = {-1, -1};
+            if (real_pipe(pipefd) != 0) {
+                scheduling_failed = true;
+                scheduling_error = std::string("Failed to create worker pipe: ") + std::strerror(errno);
+                break;
+            }
+
+            std::cout.flush();
+            std::cerr.flush();
+
+            const std::string& input_file = files[next_index];
+            pid_t pid = real_fork();
+            if (pid < 0) {
+                real_close(pipefd[0]);
+                real_close(pipefd[1]);
+                scheduling_failed = true;
+                scheduling_error = std::string("Failed to fork worker: ") + std::strerror(errno);
+                break;
+            }
+
+            if (pid == 0) {
+                real_close(pipefd[0]);
+
+                ChildRunMessage message = {};
+                int exit_code = EXIT_FAILURE;
+
+                try {
+                    message = make_child_message(run_single_file(input_file, false));
+                    if (!message.success && message.error_message[0] == '\0') {
+                        set_child_error_message(message, "Lumina push completed with issues");
+                    }
+                    exit_code = message.success ? EXIT_SUCCESS : EXIT_FAILURE;
+                }
+                catch (const std::exception& e) {
+                    set_child_error_message(message, e.what());
+                }
+
+                write_full(pipefd[1], &message, sizeof(message));
+                real_close(pipefd[1]);
+                std::exit(exit_code);
+            }
+
+            real_close(pipefd[1]);
+            running.push_back(WorkerProcess{pid, pipefd[0], input_file});
+            next_index++;
+        }
+
+        if (running.empty()) {
+            break;
+        }
+
+        int status = 0;
+        pid_t finished_pid = real_waitpid(-1, &status, 0);
+        if (finished_pid < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw std::runtime_error(std::string("waitpid failed: ") + std::strerror(errno));
+        }
+
+        auto worker_it = std::find_if(running.begin(), running.end(),
+            [finished_pid](const WorkerProcess& worker) {
+                return worker.pid == finished_pid;
+            });
+        if (worker_it == running.end()) {
+            continue;
+        }
+
+        ChildRunMessage message = {};
+        const bool received_message = read_full(worker_it->read_fd, &message, sizeof(message));
+        real_close(worker_it->read_fd);
+
+        std::string error_text;
+        if (!received_message) {
+            error_text = "worker exited without a result message";
+        }
+        else if (message.error_message[0] != '\0') {
+            error_text = message.error_message;
+        }
+
+        const bool worker_ok = received_message &&
+            WIFEXITED(status) &&
+            WEXITSTATUS(status) == EXIT_SUCCESS &&
+            message.success != 0;
+
+        if (!worker_ok && error_text.empty()) {
+            error_text = wait_status_message(status);
+        }
+
+        std::cout << (worker_ok ? CLR(Green) : CLR(Red))
+                  << (worker_ok ? "[+]" : "[-]")
+                  << CLR(Reset) << " " << worker_it->input_file
+                  << "  total=" << message.total
+                  << " new=" << message.new_count
+                  << " exists=" << message.exists
+                  << " skipped=" << message.skip
+                  << " errors=" << message.error;
+        if (!error_text.empty()) {
+            std::cout << "  (" << error_text << ")";
+        }
+        std::cout << "\n";
+
+        batch.lumina.total += static_cast<size_t>(message.total);
+        batch.lumina.skip += static_cast<size_t>(message.skip);
+        batch.lumina.new_count += static_cast<size_t>(message.new_count);
+        batch.lumina.exists += static_cast<size_t>(message.exists);
+        batch.lumina.error += static_cast<size_t>(message.error);
+
+        if (worker_ok) {
+            batch.files_succeeded++;
+        }
+        else {
+            batch.files_failed++;
+        }
+
+        running.erase(worker_it);
+    }
+
+    if (scheduling_failed) {
+        batch.files_failed += files.size() - next_index;
+        std::cerr << CLR(Red) << "[-] " << scheduling_error << CLR(Reset) << "\n";
+    }
+
+    std::cout << "\n";
+    std::cout << CLR(Bold) << "Batch Results" << CLR(Reset) << "\n";
+    std::cout << std::string(50, '-') << "\n";
+    std::cout << "  Files total:     " << batch.files_total << "\n";
+    std::cout << "  " << CLR(Green) << "Succeeded:    " << batch.files_succeeded << CLR(Reset) << "\n";
+    if (batch.files_failed > 0) {
+        std::cout << "  " << CLR(Red) << "Failed:       " << batch.files_failed << CLR(Reset) << "\n";
+    }
+    else {
+        std::cout << "  Failed:       0\n";
+    }
+    std::cout << "  Total pushed:    " << batch.lumina.total << "\n";
+    std::cout << "  " << CLR(Green) << "New:          " << batch.lumina.new_count << CLR(Reset) << "\n";
+    std::cout << "  " << CLR(Cyan) << "Exists:       " << batch.lumina.exists << CLR(Reset) << "\n";
+    std::cout << "  " << CLR(Dim) << "Skipped:      " << batch.lumina.skip << CLR(Reset) << "\n";
+    if (batch.lumina.error > 0) {
+        std::cout << "  " << CLR(Red) << "Errors:       " << batch.lumina.error << CLR(Reset) << "\n";
+    }
+    std::cout << std::string(50, '-') << "\n";
+
+    return batch.files_failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+#endif
+
 static void print_usage(const char* prog) {
     std::cout << CLR(Bold) << "IDA Pro Lumina Push Tool" << CLR(Reset) << "\n\n";
-    std::cout << CLR(Cyan) << "Usage:" << CLR(Reset) << " " << prog << " [options] <binary_file>\n\n";
+    std::cout << CLR(Cyan) << "Usage:" << CLR(Reset) << " " << prog << " [options] <input_path>\n\n";
     std::cout << CLR(Cyan) << "Description:" << CLR(Reset) << "\n";
-    std::cout << "  Analyzes a binary and pushes all function metadata to the Lumina server.\n\n";
+    std::cout << "  Analyzes a binary and pushes all function metadata to the Lumina server.\n";
+    std::cout << "  With --recursive, scans a directory tree and processes files in forked workers.\n\n";
     std::cout << CLR(Cyan) << "Options:" << CLR(Reset) << "\n";
     std::cout << "  -q, --quiet          Suppress IDA's verbose messages\n";
+    std::cout << "  -r, --recursive      Recursively process all files under <input_path>\n";
     std::cout << "  -v, --verbose        Show extra debug output\n";
+    std::cout << "  -j, --jobs <count>   Worker processes for --recursive (default: CPU count)\n";
     std::cout << "  --no-color           Disable colored output\n";
     std::cout << "  --no-plugins         Don't load user plugins (except Hex-Rays)\n";
     std::cout << "  --plugin <pattern>   Load plugins matching pattern (implies --no-plugins)\n";
@@ -498,10 +950,15 @@ static void print_usage(const char* prog) {
     std::cout << CLR(Cyan) << "Examples:" << CLR(Reset) << "\n";
     std::cout << "  " << prog << " program.exe         # Analyze and push to Lumina\n";
     std::cout << "  " << prog << " -q program.exe      # Quiet mode\n";
+    std::cout << "  " << prog << " -r samples/         # Recursively push a folder\n";
+    std::cout << "  " << prog << " -r -j 4 samples/    # Limit recursive mode to 4 workers\n";
     std::cout << "\n";
     std::cout << CLR(Cyan) << "Note:" << CLR(Reset) << "\n";
     std::cout << "  Lumina credentials must be configured in IDA Pro settings.\n";
     std::cout << "  The tool uses IDA's existing Lumina configuration.\n";
+#ifdef _WIN32
+    std::cout << "  Recursive mode is unavailable on Windows because it requires fork().\n";
+#endif
     std::cout << "\n";
 }
 
@@ -516,8 +973,26 @@ static bool parse_args(int argc, char* argv[]) {
         else if (arg == "-q" || arg == "--quiet") {
             g_opts.quiet = true;
         }
+        else if (arg == "-r" || arg == "--recursive") {
+            g_opts.recursive = true;
+        }
         else if (arg == "-v" || arg == "--verbose") {
             g_opts.verbose = true;
+        }
+        else if (arg == "-j" || arg == "--jobs") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --jobs requires a count argument\n";
+                return false;
+            }
+
+            unsigned int jobs = 0;
+            if (!parse_positive_uint(argv[++i], jobs)) {
+                std::cerr << "Error: --jobs expects a positive integer\n";
+                return false;
+            }
+
+            g_opts.jobs = jobs;
+            g_opts.jobs_specified = true;
         }
         else if (arg == "--no-color") {
             Color::disable();
@@ -552,6 +1027,11 @@ static bool parse_args(int argc, char* argv[]) {
         return false;
     }
 
+    if (g_opts.jobs_specified && !g_opts.recursive) {
+        std::cerr << "Error: --jobs requires --recursive\n";
+        return false;
+    }
+
     return true;
 }
 
@@ -565,59 +1045,22 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    std::error_code input_ec;
+    if (!g_opts.recursive && std::filesystem::is_directory(g_opts.input_file, input_ec) && !input_ec) {
+        std::cerr << "Error: " << g_opts.input_file << " is a directory; use --recursive to process folders\n";
+        return EXIT_FAILURE;
+    }
+
     try {
-        HeadlessIdaContext ctx(g_opts.input_file.c_str());
-
-        // Print basic info
-        if (!g_opts.quiet) {
-            size_t func_count = get_func_qty();
-            std::cout << "\n";
-            std::cout << CLR(Bold) << "Lumina Push" << CLR(Reset) << "\n";
-            std::cout << std::string(50, '-') << "\n";
-            std::cout << "  Functions: " << func_count << "\n";
-            std::cout << "\n";
+        if (g_opts.recursive) {
+#ifdef _WIN32
+            throw std::runtime_error("Recursive mode is not supported on Windows because ida_lumina uses fork() workers.");
+#else
+            return run_recursive_mode();
+#endif
         }
 
-        // Connect to Lumina
-        std::cout << "[*] Connecting to Lumina server..." << std::endl;
-
-        LuminaConnection lumina;
-        if (!lumina.connect(0)) {
-            std::cerr << CLR(Red) << "[-] Failed to connect to Lumina server" << CLR(Reset) << "\n";
-            std::cerr << "    Make sure Lumina is configured in IDA settings.\n";
-            return EXIT_FAILURE;
-        }
-
-        std::cout << CLR(Green) << "[+] Connected to Lumina" << CLR(Reset) << "\n";
-
-        // Push all metadata
-        std::cout << "[*] Pushing function metadata to Lumina..." << std::endl;
-
-        PushStats stats;
-        bool success = lumina.push_all(stats);
-
-        // Print results
-        std::cout << "\n";
-        std::cout << CLR(Bold) << "Results" << CLR(Reset) << "\n";
-        std::cout << std::string(50, '-') << "\n";
-        std::cout << "  Total processed: " << stats.total << "\n";
-        std::cout << "  " << CLR(Green) << "New:      " << stats.new_count << CLR(Reset) << "\n";
-        std::cout << "  " << CLR(Cyan) << "Exists:   " << stats.exists << CLR(Reset) << "\n";
-        std::cout << "  " << CLR(Dim) << "Skipped:  " << stats.skip << CLR(Reset) << "\n";
-        if (stats.error > 0) {
-            std::cout << "  " << CLR(Red) << "Errors:   " << stats.error << CLR(Reset) << "\n";
-        }
-        std::cout << std::string(50, '-') << "\n";
-
-        if (success) {
-            std::cout << CLR(Green) << "[+] Lumina push completed successfully" << CLR(Reset) << "\n";
-        } else {
-            std::cout << CLR(Yellow) << "[!] Lumina push completed with issues" << CLR(Reset) << "\n";
-        }
-
-        if (!g_opts.quiet) {
-            std::cout << "[*] Done.\n";
-        }
+        run_single_file(g_opts.input_file, true);
     }
     catch (const std::exception &e) {
         std::cerr << CLR(Red) << "[FATAL] " << CLR(Reset) << e.what() << std::endl;

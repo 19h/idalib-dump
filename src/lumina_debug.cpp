@@ -78,6 +78,7 @@ struct Options
     std::vector<std::string> plugin_patterns;
     bool csv_output = false;
     bool show_function_bytes = false;
+    bool show_instruction_calcrel = false;
     bool quiet = false;
     bool no_plugins = false;
     bool verbose = false;
@@ -340,6 +341,22 @@ static void append_hex_byte(std::string &out, uchar byte)
     out.push_back(digits[byte & 0xF]);
 }
 
+static std::string bytes_to_hex(const uchar *data, size_t size)
+{
+    std::string out;
+    out.reserve(size * 2);
+    for (size_t i = 0; i < size; ++i)
+        append_hex_byte(out, data[i]);
+    return out;
+}
+
+static std::string relbits_to_hex(const bytevec_t &bits)
+{
+    if (bits.empty())
+        return "";
+    return bytes_to_hex(bits.begin(), bits.size());
+}
+
 static std::string get_input_path()
 {
     char buf[QMAXPATH] = {0};
@@ -423,6 +440,14 @@ struct FunctionBytesInfo
     std::string hex;
 };
 
+struct InstructionCalcRelRecord
+{
+    ea_t ea = BADADDR;
+    size_t size = 0;
+    std::string bytes_hex;
+    std::string relbits_hex;
+};
+
 struct FunctionRecord
 {
     ea_t ea = BADADDR;
@@ -436,6 +461,7 @@ struct FunctionRecord
     size_t function_bytes_len = 0;
     std::string function_byte_chunks;
     std::string function_bytes_hex;
+    std::vector<InstructionCalcRelRecord> instruction_calcrel;
     MetadataSummary metadata;
 };
 
@@ -556,6 +582,45 @@ static FunctionBytesInfo get_function_bytes_info(const func_t *pfn)
     return info;
 }
 
+static std::vector<InstructionCalcRelRecord> get_instruction_calcrel_info(const func_t *pfn)
+{
+    std::vector<InstructionCalcRelRecord> records;
+    if (pfn == nullptr)
+        return records;
+
+    func_item_iterator_t item_iter;
+    for (bool ok = item_iter.set(const_cast<func_t *>(pfn)); ok; ok = item_iter.next_head())
+    {
+        ea_t ea = item_iter.current();
+        flags64_t flags = get_flags(ea);
+        if (!is_code(flags))
+            continue;
+
+        bytevec_t relbits;
+        size_t consumed = 0;
+        ssize_t status = processor_t::calcrel(&relbits, &consumed, ea);
+        if (consumed == 0 || status < 0)
+            continue;
+
+        qvector<uchar> bytes;
+        bytes.resize(consumed);
+        ssize_t read_size = get_bytes(bytes.begin(), static_cast<ssize_t>(consumed), ea, GMB_READALL);
+        if (read_size < 0)
+            throw std::runtime_error("Cancelled while reading instruction bytes for " + format_ea(ea));
+        if (read_size == 0)
+            continue;
+
+        InstructionCalcRelRecord record;
+        record.ea = ea;
+        record.size = consumed;
+        record.bytes_hex = bytes_to_hex(bytes.begin(), static_cast<size_t>(read_size));
+        record.relbits_hex = relbits_to_hex(relbits);
+        records.push_back(std::move(record));
+    }
+
+    return records;
+}
+
 static FunctionRecord build_record(const func_t *pfn, ea_t imagebase)
 {
     FunctionRecord record;
@@ -580,6 +645,9 @@ static FunctionRecord build_record(const func_t *pfn, ea_t imagebase)
         record.function_byte_chunks = std::move(bytes_info.chunks);
         record.function_bytes_hex = std::move(bytes_info.hex);
     }
+
+    if (g_opts.show_instruction_calcrel)
+        record.instruction_calcrel = get_instruction_calcrel_info(pfn);
 
     record.metadata = summarize_metadata(fi);
 
@@ -630,6 +698,22 @@ static std::vector<FunctionRecord> collect_records(AnalysisSummary &summary)
 static void write_csv_row(std::ostream &out, const AnalysisSummary &summary, const FunctionRecord &record)
 {
     std::string metadata_keys = join_strings(record.metadata.keys, "|");
+    std::string instruction_calcrel;
+    if (g_opts.show_instruction_calcrel)
+    {
+        std::ostringstream oss;
+        for (size_t i = 0; i < record.instruction_calcrel.size(); ++i)
+        {
+            if (i != 0)
+                oss << '|';
+            const InstructionCalcRelRecord &insn = record.instruction_calcrel[i];
+            oss << format_ea(insn.ea)
+                << ':' << insn.size
+                << ':' << insn.bytes_hex
+                << ':' << insn.relbits_hex;
+        }
+        instruction_calcrel = oss.str();
+    }
 
     out
         << csv_escape(format_ea(record.ea)) << ','
@@ -658,6 +742,9 @@ static void write_csv_row(std::ostream &out, const AnalysisSummary &summary, con
             << ',' << csv_escape(record.function_byte_chunks)
             << ',' << csv_escape(record.function_bytes_hex);
 
+    if (g_opts.show_instruction_calcrel)
+        out << ',' << csv_escape(instruction_calcrel);
+
     out << ','
         << csv_escape(format_md5(summary.input_md5)) << ','
         << csv_escape(summary.input_path)
@@ -669,6 +756,8 @@ static void emit_csv(std::ostream &out, const AnalysisSummary &summary, const st
     out << "ea,rva,segment,function_size,lumina_md5,db_name,lumina_name,demangled_name,metadata_bytes,metadata_keys,has_type,has_function_comment,has_repeatable_function_comment,has_insn_comments,has_insn_repeatable_comments,has_extra_comments,has_user_stack_points,has_frame_desc,has_operand_reprs,has_operand_reprs_ex";
     if (g_opts.show_function_bytes)
         out << ",function_bytes_len,function_byte_chunks,function_bytes_hex";
+    if (g_opts.show_instruction_calcrel)
+        out << ",instruction_calcrel";
     out << ",input_md5,input_path\n";
     for (const FunctionRecord &record : records)
         write_csv_row(out, summary, record);
@@ -735,6 +824,19 @@ static void emit_text(std::ostream &out, const AnalysisSummary &summary, const s
                 << "  byte_chunks=" << (record.function_byte_chunks.empty() ? "-" : record.function_byte_chunks)
                 << "\n";
             out << "  bytes_hex=" << (record.function_bytes_hex.empty() ? "-" : record.function_bytes_hex) << "\n";
+        }
+
+        if (g_opts.show_instruction_calcrel)
+        {
+            out << "  calcrel_instructions=" << record.instruction_calcrel.size() << "\n";
+            for (const InstructionCalcRelRecord &insn : record.instruction_calcrel)
+            {
+                out << "    " << format_ea(insn.ea)
+                    << " size=" << insn.size
+                    << " bytes=" << (insn.bytes_hex.empty() ? "-" : insn.bytes_hex)
+                    << " relbits=" << (insn.relbits_hex.empty() ? "-" : insn.relbits_hex)
+                    << "\n";
+            }
         }
     }
 }
@@ -939,6 +1041,7 @@ static void print_usage(const char *prog)
     std::cout << "  --csv                Emit CSV instead of human-readable text\n";
     std::cout << "  --bytes              Include hex-encoded function bytes, byte length,\n";
     std::cout << "                       and chunk ranges from IDA\n";
+    std::cout << "  --calcrel-insns      Include per-instruction CalcRel bytes/relbits\n";
     std::cout << "  -o, --output <file>  Write output to a file\n";
     std::cout << "  -f, --filter <pat>   Filter functions by name (regex or substring)\n";
     std::cout << "  -F, --functions <l>  Comma or pipe-separated function names/addresses\n";
@@ -953,6 +1056,7 @@ static void print_usage(const char *prog)
     std::cout << "  " << prog << " sample.exe\n";
     std::cout << "  " << prog << " --csv sample.exe\n";
     std::cout << "  " << prog << " --bytes sample.exe\n";
+    std::cout << "  " << prog << " --calcrel-insns sample.exe\n";
     std::cout << "  " << prog << " --csv -o lumina.csv sample.exe\n";
     std::cout << "  " << prog << " -f main sample.exe\n";
     std::cout << "  " << prog << " -F \"main,0x140001000\" sample.exe\n";
@@ -976,6 +1080,10 @@ static bool parse_args(int argc, char *argv[])
         else if (arg == "--bytes" || arg == "--function-bytes")
         {
             g_opts.show_function_bytes = true;
+        }
+        else if (arg == "--calcrel-insns" || arg == "--relbits")
+        {
+            g_opts.show_instruction_calcrel = true;
         }
         else if (arg == "-o" || arg == "--output")
         {

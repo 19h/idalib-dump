@@ -145,17 +145,19 @@ ida_dump -v --mc program.exe
 ## ida_lumina Usage
 
 ```
-ida_lumina [options] <binary_file>
+ida_lumina [options] <input_path>
 ```
 
-Analyzes a binary and pushes all function metadata to the Hex-Rays Lumina server.
+Analyzes a binary and pushes all function metadata to the Hex-Rays Lumina server. With `--recursive`, it scans a directory tree and processes each file in a separate worker process.
 
 ### Options
 
 | Flag | Description |
 |------|-------------|
 | `-q, --quiet` | Suppress IDA's verbose messages |
+| `-r, --recursive` | Recursively process all files under `<input_path>` |
 | `-v, --verbose` | Show extra debug output |
+| `-j, --jobs <count>` | Worker processes for `--recursive` (defaults to CPU count) |
 | `--no-color` | Disable colored output |
 | `--no-plugins` | Don't load user plugins (Hex-Rays still loads) |
 | `--plugin <pattern>` | Load plugins matching pattern (implies `--no-plugins`) |
@@ -169,11 +171,17 @@ ida_lumina program.exe
 # Quiet mode
 ida_lumina -q program.exe
 
+# Recursively process a directory with one worker per CPU
+ida_lumina -r samples/
+
+# Recursively process a directory with custom concurrency
+ida_lumina -r -j 4 samples/
+
 # With specific plugin enabled
 ida_lumina --plugin dazhbog program.exe
 ```
 
-**Note**: Lumina credentials must be configured in IDA Pro settings. The tool uses IDA's existing Lumina configuration.
+**Note**: Lumina credentials must be configured in IDA Pro settings. The tool uses IDA's existing Lumina configuration. Recursive mode is Unix-only because it uses `fork()` workers to avoid sharing single-threaded `idalib` state.
 
 ## ida_lumina_debug Usage
 
