@@ -186,10 +186,10 @@ ida_lumina --plugin dazhbog program.exe
 ## ida_lumina_debug Usage
 
 ```
-ida_lumina_debug [options] <binary_file>
+ida_lumina_debug [options] <input_path>
 ```
 
-Analyzes a binary and dumps per-function Lumina-relevant metadata such as the calculated function MD5, EA/RVA, names, and a metadata-key/presence summary.
+Analyzes a binary and dumps per-function Lumina-relevant metadata such as the calculated function MD5, EA/RVA, names, and a metadata-key/presence summary. With `--recursive`, it scans a directory tree and processes each file in a separate worker process.
 
 ### Options
 
@@ -197,10 +197,13 @@ Analyzes a binary and dumps per-function Lumina-relevant metadata such as the ca
 |------|-------------|
 | `--csv` | Emit CSV instead of human-readable text |
 | `--bytes` | Include hex-encoded function bytes, total byte length, and chunk ranges from IDA |
+| `--calcrel-insns` | Include per-instruction CalcRel byte/relbit details |
 | `-o, --output <file>` | Write output to a file |
 | `-f, --filter <pattern>` | Filter functions by name (regex or substring) |
 | `-F, --functions <list>` | Comma or pipe-separated list of function names/addresses |
 | `-a, --address <hex>` | Dump only the function at a specific address |
+| `-r, --recursive` | Recursively process all files under `<input_path>` |
+| `-j, --jobs <count>` | Worker processes for `--recursive` (defaults to CPU count) |
 | `-q, --quiet` | Suppress IDA's verbose messages |
 | `-v, --verbose` | Show extra name detail in text mode |
 | `--no-color` | Disable colored output |
@@ -219,8 +222,17 @@ ida_lumina_debug --csv program.exe
 # Include function bytes in the output
 ida_lumina_debug --bytes program.exe
 
+# Include per-instruction CalcRel details
+ida_lumina_debug --calcrel-insns program.exe
+
 # CSV to a file
 ida_lumina_debug --csv -o lumina.csv program.exe
+
+# Recursively emit combined CSV for a directory
+ida_lumina_debug -r --csv samples/
+
+# Recursively emit combined CSV with custom concurrency
+ida_lumina_debug -r -j 4 --csv -o lumina.csv samples/
 
 # Focus on one function by name
 ida_lumina_debug -f main program.exe
@@ -228,6 +240,8 @@ ida_lumina_debug -f main program.exe
 # Focus on explicit names/addresses
 ida_lumina_debug -F "main,parse_config,0x140001000" program.exe
 ```
+
+**Note**: Recursive mode is Unix-only because it uses `fork()` workers to avoid sharing single-threaded `idalib` state.
 
 ## Output Format
 
