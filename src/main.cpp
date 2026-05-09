@@ -25,10 +25,12 @@
 #include <regex>
 #include <cstdlib>
 #include <cstdarg>
+#include <cstdio>
 #include <new>
 #include <filesystem>
 #include <chrono>
 #include <iomanip>
+#include <thread>
 
 // Save real setenv/getenv and FILE* pointers before IDA SDK redefines them with macros
 static inline int real_setenv(const char* name, const char* value) {
@@ -47,6 +49,7 @@ static inline const char* real_getenv(const char* name) {
 static FILE* real_stdout = stdout;
 static FILE* real_stderr = stderr;
 static inline int real_fflush(FILE* stream) { return fflush(stream); }
+static inline char* real_fgets(char* str, int count, FILE* stream) { return fgets(str, count, stream); }
 static inline int real_fprintf(FILE* stream, const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -67,6 +70,9 @@ static inline int posix_dup(int fd) { return _dup(fd); }
 static inline int posix_dup2(int fd1, int fd2) { return _dup2(fd1, fd2); }
 static inline int posix_close(int fd) { return _close(fd); }
 static inline int posix_open(const char* path, int flags) { return _open(path, flags); }
+static inline FILE* real_popen(const char* command, const char* mode) { return _popen(command, mode); }
+static inline int real_pclose(FILE* stream) { return _pclose(stream); }
+static inline int current_process_id() { return _getpid(); }
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2
 #define O_WRONLY _O_WRONLY
@@ -87,6 +93,9 @@ static inline int posix_dup(int fd) { return dup(fd); }
 static inline int posix_dup2(int fd1, int fd2) { return dup2(fd1, fd2); }
 static inline int posix_close(int fd) { return close(fd); }
 static inline int posix_open(const char* path, int flags) { return open(path, flags); }
+static inline FILE* real_popen(const char* command, const char* mode) { return popen(command, mode); }
+static inline int real_pclose(FILE* stream) { return pclose(stream); }
+static inline int current_process_id() { return getpid(); }
 #endif
 
 // From noplugins.c - controls plugin blocking
@@ -128,6 +137,7 @@ struct Options {
     std::string input_file;
     std::string output_file;         // Output file (empty = stdout)
     std::string filter_pattern;      // Function name filter (regex)
+    std::string sybil_url;           // Hidden: embedding endpoint URL
     ea_t filter_address = BADADDR;   // Filter by specific address
     std::vector<std::string> function_list;  // Explicit list of functions (names or addresses)
     std::vector<std::string> plugin_patterns;  // Additional plugins to load in no-plugins mode
@@ -141,6 +151,7 @@ struct Options {
     bool list_functions = false;     // Just list function names
     bool verbose = false;            // Show extra metadata
     bool no_plugins = false;         // Disable loading user plugins
+    bool sybil_embeddings = false;   // Hidden: request embeddings instead of dumping
 };
 
 static Options g_opts;
@@ -629,6 +640,14 @@ static std::string format_pseudocode_block(const std::string &input) {
 // Output Handling
 //=============================================================================
 
+struct SybilFunctionInput {
+    std::string name;
+    std::string address;
+    std::string pseudo;
+    std::string mc;
+    std::string asm_text;
+};
+
 class MicrocodePrinter : public vd_printer_t {
 private:
     std::ostream &m_out;
@@ -1053,6 +1072,68 @@ public:
         return true;
     }
 
+    static bool collect_sybil_input(func_t *pfn, SybilFunctionInput &item) {
+        if (!pfn) return false;
+
+        qstring fname;
+        get_func_name(&fname, pfn->start_ea);
+
+        if (!should_process(pfn, fname.c_str())) {
+            g_stats.skipped++;
+            return false;
+        }
+
+        if (g_opts.show_assembly) {
+            item.asm_text = collect_assembly(pfn);
+        }
+
+        bool needs_decompiler = g_opts.show_microcode || g_opts.show_pseudocode;
+        bool success = true;
+        std::string err_msg;
+
+        if (needs_decompiler) {
+            if (!g_hexrays_available) {
+                success = false;
+                err_msg = "Hex-Rays decompiler is not available";
+            } else {
+                hexrays_failure_t hf;
+                cfuncptr_t cfunc = decompile(pfn, &hf, DECOMP_WARNINGS);
+                success = (cfunc != nullptr);
+
+                if (!success) {
+                    err_msg = hf.desc().c_str();
+                    if (err_msg.find("special segment") != std::string::npos ||
+                        err_msg.find("call analysis failed") != std::string::npos) {
+                        g_stats.skipped++;
+                        return false;
+                    }
+                } else {
+                    if (g_opts.show_microcode) item.mc = collect_microcode((cfunc_t*)cfunc);
+                    if (g_opts.show_pseudocode) item.pseudo = collect_pseudocode((cfunc_t*)cfunc);
+                }
+            }
+        }
+
+        if (!success) {
+            g_stats.decompiled_fail++;
+            g_stats.errors.push_back({fname.c_str(), err_msg});
+            if (item.asm_text.empty()) {
+                return false;
+            }
+        } else {
+            g_stats.decompiled_ok++;
+        }
+
+        if (item.pseudo.empty() && item.mc.empty() && item.asm_text.empty()) {
+            g_stats.skipped++;
+            return false;
+        }
+
+        item.name = fname.c_str();
+        item.address = format_address(pfn->start_ea);
+        return true;
+    }
+
     static void list(func_t *pfn) {
         if (!pfn) return;
 
@@ -1126,26 +1207,15 @@ private:
 
     static void dump_assembly(func_t *pfn) {
         out << CLR(Yellow) << "-- Assembly " << CLR(Dim) << std::string(65, '-') << CLR(Reset) << "\n";
-
-        func_item_iterator_t fii;
-        for (bool ok = fii.set(pfn); ok; ok = fii.next_code()) {
-            ea_t ea = fii.current();
-            qstring line;
-
-            if (generate_disasm_line(&line, ea, GENDSM_REMOVE_TAGS | GENDSM_MULTI_LINE | GENDSM_FORCE_CODE)) {
-                line.trim2();
-                out << CLR(Dim) << format_address(ea) << CLR(Reset) << "  " << line.c_str() << "\n";
-            }
-        }
+        out << collect_assembly(pfn);
         out << "\n";
     }
 
     static void dump_microcode(cfunc_t *cfunc) {
         out << CLR(Yellow) << "-- Microcode " << CLR(Dim) << std::string(64, '-') << CLR(Reset) << "\n";
-
-        if (mba_t *mba = cfunc->mba) {
-            MicrocodePrinter printer(*g_output);
-            mba->print(printer);
+        std::string microcode = collect_microcode(cfunc);
+        if (!microcode.empty()) {
+            out << microcode;
         } else {
             out << CLR(Dim) << "  (No microcode available)" << CLR(Reset) << "\n";
         }
@@ -1154,7 +1224,46 @@ private:
 
     static void dump_pseudocode(cfunc_t *cfunc) {
         out << CLR(Yellow) << "-- Pseudocode " << CLR(Dim) << std::string(63, '-') << CLR(Reset) << "\n";
+        std::string formatted = collect_pseudocode(cfunc);
+        std::istringstream stream(formatted);
+        std::string line;
+        while (std::getline(stream, line)) {
+            if (!g_opts.output_file.empty()) {
+                // No highlighting for file output
+                out << line << "\n";
+            } else {
+                out << format_pseudocode_line(qstring(line.c_str())) << "\n";
+            }
+        }
+        out << "\n";
+    }
 
+    static std::string collect_assembly(func_t *pfn) {
+        std::ostringstream text;
+        func_item_iterator_t fii;
+        for (bool ok = fii.set(pfn); ok; ok = fii.next_code()) {
+            ea_t ea = fii.current();
+            qstring line;
+
+            if (generate_disasm_line(&line, ea, GENDSM_REMOVE_TAGS | GENDSM_MULTI_LINE | GENDSM_FORCE_CODE)) {
+                line.trim2();
+                text << format_address(ea) << "  " << line.c_str() << "\n";
+            }
+        }
+        return text.str();
+    }
+
+    static std::string collect_microcode(cfunc_t *cfunc) {
+        if (!cfunc || !cfunc->mba) {
+            return "";
+        }
+        std::ostringstream text;
+        MicrocodePrinter printer(text);
+        cfunc->mba->print(printer);
+        return text.str();
+    }
+
+    static std::string collect_pseudocode(cfunc_t *cfunc) {
         const strvec_t &sv = cfunc->get_pseudocode();
         std::string pseudo_block;
         pseudo_block.reserve(1024);
@@ -1167,18 +1276,7 @@ private:
             pseudo_block.push_back('\n');
         }
 
-        std::string formatted = format_pseudocode_block(pseudo_block);
-        std::istringstream stream(formatted);
-        std::string line;
-        while (std::getline(stream, line)) {
-            if (!g_opts.output_file.empty()) {
-                // No highlighting for file output
-                out << line << "\n";
-            } else {
-                out << format_pseudocode_line(qstring(line.c_str())) << "\n";
-            }
-        }
-        out << "\n";
+        return format_pseudocode_block(pseudo_block);
     }
 };
 
@@ -1221,6 +1319,404 @@ static void print_summary() {
     }
 
     std::cout << std::string(78, '=') << "\n";
+}
+
+//=============================================================================
+// Sybil Embedding Requests
+//=============================================================================
+
+static std::string json_escape(const std::string &text) {
+    std::ostringstream out;
+    for (unsigned char c : text) {
+        switch (c) {
+            case '"': out << "\\\""; break;
+            case '\\': out << "\\\\"; break;
+            case '\b': out << "\\b"; break;
+            case '\f': out << "\\f"; break;
+            case '\n': out << "\\n"; break;
+            case '\r': out << "\\r"; break;
+            case '\t': out << "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    out << "\\u" << std::hex << std::setw(4) << std::setfill('0') << (int)c
+                        << std::dec << std::setfill(' ');
+                } else {
+                    out << c;
+                }
+                break;
+        }
+    }
+    return out.str();
+}
+
+static bool ends_with(const std::string &text, const std::string &suffix) {
+    return text.size() >= suffix.size() &&
+           text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static std::string normalize_sybil_auto_url(const std::string &url) {
+    std::string normalized = url;
+    while (!normalized.empty() && normalized.back() == '/') {
+        normalized.pop_back();
+    }
+
+    if (ends_with(normalized, "/v1/embed")) {
+        normalized.replace(normalized.size() - strlen("/v1/embed"), strlen("/v1/embed"), "/v1/auto");
+    } else if (ends_with(normalized, "/embed")) {
+        normalized.replace(normalized.size() - strlen("/embed"), strlen("/embed"), "/auto");
+    } else if (ends_with(normalized, "/v1/auto") || ends_with(normalized, "/auto")) {
+        return normalized;
+    } else if (ends_with(normalized, "/v1")) {
+        normalized += "/auto";
+    } else {
+        normalized += "/v1/auto";
+    }
+
+    return normalized;
+}
+
+static std::string shell_quote(const std::string &text) {
+#ifdef _WIN32
+    std::string quoted = "\"";
+    for (char c : text) {
+        if (c == '"' || c == '\\') quoted.push_back('\\');
+        quoted.push_back(c);
+    }
+    quoted.push_back('"');
+    return quoted;
+#else
+    std::string quoted = "'";
+    for (char c : text) {
+        if (c == '\'') quoted += "'\\''";
+        else quoted.push_back(c);
+    }
+    quoted.push_back('\'');
+    return quoted;
+#endif
+}
+
+static std::string build_sybil_request_json(const std::vector<SybilFunctionInput> &items,
+                                            size_t begin,
+                                            size_t end) {
+    std::ostringstream json;
+    json << "{\"inputs\":[";
+    for (size_t i = begin; i < end; ++i) {
+        if (i > begin) json << ",";
+        json << "{";
+        bool wrote_field = false;
+        if (!items[i].pseudo.empty()) {
+            json << "\"pseudo\":\"" << json_escape(items[i].pseudo) << "\"";
+            wrote_field = true;
+        }
+        if (!items[i].mc.empty()) {
+            if (wrote_field) json << ",";
+            json << "\"mc\":\"" << json_escape(items[i].mc) << "\"";
+            wrote_field = true;
+        }
+        if (!items[i].asm_text.empty()) {
+            if (wrote_field) json << ",";
+            json << "\"asm\":\"" << json_escape(items[i].asm_text) << "\"";
+        }
+        json << "}";
+    }
+    json << "]}";
+    return json.str();
+}
+
+static bool run_curl_post_json(const std::string &url,
+                               const std::string &request_json,
+                               std::string &response,
+                               std::string &error) {
+    std::filesystem::path tmp_path = std::filesystem::temp_directory_path() /
+        ("idalib_sybil_" + std::to_string(current_process_id()) + "_" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
+
+    {
+        std::ofstream request_file(tmp_path, std::ios::binary);
+        if (!request_file) {
+            error = "failed to create request file: " + tmp_path.string();
+            return false;
+        }
+        request_file << request_json;
+    }
+
+    std::string command = "curl -sS --retry 3 --retry-all-errors --retry-delay 1 --max-time 180 "
+        "-X POST -H " +
+        shell_quote("Content-type: application/json") +
+        " --data-binary @" + shell_quote(tmp_path.string()) +
+        " " + shell_quote(url);
+
+    FILE *pipe = real_popen(command.c_str(), "r");
+    if (!pipe) {
+        std::filesystem::remove(tmp_path);
+        error = "failed to execute curl";
+        return false;
+    }
+
+    char buffer[4096];
+    while (real_fgets(buffer, sizeof(buffer), pipe)) {
+        response.append(buffer);
+    }
+
+    int rc = real_pclose(pipe);
+    std::filesystem::remove(tmp_path);
+
+    if (rc != 0) {
+        error = "curl exited with status " + std::to_string(rc);
+        return false;
+    }
+    return true;
+}
+
+static size_t skip_json_ws(const std::string &text, size_t pos) {
+    while (pos < text.size() && std::isspace((unsigned char)text[pos])) ++pos;
+    return pos;
+}
+
+static bool find_balanced_json_array(const std::string &text,
+                                     size_t open_pos,
+                                     size_t &close_pos) {
+    if (open_pos >= text.size() || text[open_pos] != '[') return false;
+
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (size_t i = open_pos; i < text.size(); ++i) {
+        char c = text[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '[') {
+            ++depth;
+        } else if (c == ']') {
+            --depth;
+            if (depth == 0) {
+                close_pos = i;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool is_numeric_json_array(const std::string &array_text) {
+    bool has_digit = false;
+    for (size_t i = 0; i < array_text.size(); ++i) {
+        char c = array_text[i];
+        unsigned char uc = (unsigned char)c;
+        if (std::isdigit(uc)) {
+            has_digit = true;
+            continue;
+        }
+        if ((c == '[' && i == 0) || (c == ']' && i + 1 == array_text.size())) {
+            continue;
+        }
+        if (std::isspace(uc) || c == ',' ||
+            c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E') {
+            continue;
+        }
+        return false;
+    }
+    return has_digit;
+}
+
+static void collect_numeric_arrays(const std::string &text,
+                                   size_t begin,
+                                   size_t end,
+                                   std::vector<std::string> &arrays) {
+    bool in_string = false;
+    bool escaped = false;
+    for (size_t i = begin; i < end; ++i) {
+        char c = text[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '[') {
+            size_t close_pos = 0;
+            if (!find_balanced_json_array(text, i, close_pos)) return;
+            std::string array_text = text.substr(i, close_pos - i + 1);
+            if (is_numeric_json_array(array_text)) {
+                arrays.push_back(array_text);
+            } else {
+                collect_numeric_arrays(text, i + 1, close_pos, arrays);
+            }
+            i = close_pos;
+        }
+    }
+}
+
+static std::vector<std::string> extract_embedding_arrays(const std::string &response) {
+    std::vector<std::string> embeddings;
+
+    for (const char *key : {"\"embedding\"", "\"embeddings\""}) {
+        size_t pos = 0;
+        while ((pos = response.find(key, pos)) != std::string::npos) {
+            size_t colon = response.find(':', pos + strlen(key));
+            if (colon == std::string::npos) break;
+            size_t value = skip_json_ws(response, colon + 1);
+            if (value >= response.size() || response[value] != '[') {
+                pos = colon + 1;
+                continue;
+            }
+
+            size_t close_pos = 0;
+            if (!find_balanced_json_array(response, value, close_pos)) break;
+            std::string array_text = response.substr(value, close_pos - value + 1);
+            if (is_numeric_json_array(array_text)) {
+                embeddings.push_back(array_text);
+            } else {
+                collect_numeric_arrays(response, value + 1, close_pos, embeddings);
+            }
+            pos = close_pos + 1;
+        }
+    }
+
+    if (embeddings.empty()) {
+        collect_numeric_arrays(response, 0, response.size(), embeddings);
+    }
+
+    return embeddings;
+}
+
+static std::string response_preview(const std::string &response) {
+    constexpr size_t kMaxPreview = 2048;
+    std::string preview = response.substr(0, std::min(response.size(), kMaxPreview));
+    for (char &c : preview) {
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    }
+    if (response.size() > kMaxPreview) {
+        preview += "...";
+    }
+    return preview;
+}
+
+static bool is_sybil_batch_token_error(const std::string &response) {
+    return response.find("max-batch-estimated-tokens") != std::string::npos;
+}
+
+static bool is_sybil_batch_oom_error(const std::string &response) {
+    return response.find("out of memory") != std::string::npos ||
+           response.find("CUDA error") != std::string::npos ||
+           response.find("cuDNN") != std::string::npos ||
+           response.find("illegal memory access") != std::string::npos ||
+           response.find("CUDNN_STATUS") != std::string::npos;
+}
+
+static bool is_sybil_transient_error(const std::string &response) {
+    return response.find("error code: 502") != std::string::npos ||
+           response.find("error code: 503") != std::string::npos ||
+           response.find("error code: 504") != std::string::npos ||
+           response.find("502 Bad Gateway") != std::string::npos ||
+           response.find("503 Service Unavailable") != std::string::npos ||
+           response.find("504 Gateway Timeout") != std::string::npos ||
+           response.find("Bad Gateway") != std::string::npos ||
+           response.find("Service Unavailable") != std::string::npos ||
+           response.find("Gateway Timeout") != std::string::npos;
+}
+
+static bool is_sybil_error_response(const std::string &response) {
+    return response.find("\"error\"") != std::string::npos;
+}
+
+static void write_sybil_export(const std::vector<SybilFunctionInput> &items,
+                               const std::vector<std::string> &embeddings) {
+    out << "[";
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i > 0) out << ",";
+        out << "[\"" << json_escape(items[i].name) << "\","
+            << "\"" << json_escape(items[i].address) << "\","
+            << embeddings[i] << "]";
+    }
+    out << "]\n";
+}
+
+static bool request_sybil_embeddings(const std::vector<SybilFunctionInput> &items,
+                                     std::vector<std::string> &embeddings) {
+    constexpr size_t kInitialBatchItems = 8;
+    constexpr size_t kMaxRetryAttempts = 8;
+    std::string endpoint_url = normalize_sybil_auto_url(g_opts.sybil_url);
+    size_t max_batch_items = kInitialBatchItems;
+    size_t retry_attempts = 0;
+    size_t batch_begin = 0;
+
+    while (batch_begin < items.size()) {
+        size_t batch_end = std::min(items.size(), batch_begin + max_batch_items);
+
+        std::string response;
+        std::string error;
+        std::string request_json = build_sybil_request_json(items, batch_begin, batch_end);
+        if (!run_curl_post_json(endpoint_url, request_json, response, error)) {
+            std::cerr << "Error: Sybil request failed: " << error << "\n";
+            return false;
+        }
+
+        if (g_opts.output_file.empty()) {
+            std::cout << response;
+            if (!response.empty() && response.back() != '\n') std::cout << "\n";
+        } else {
+            std::vector<std::string> batch_embeddings = extract_embedding_arrays(response);
+            if (batch_embeddings.size() != batch_end - batch_begin) {
+                if ((is_sybil_batch_token_error(response) || is_sybil_batch_oom_error(response) ||
+                     is_sybil_transient_error(response)) &&
+                    batch_end - batch_begin > 1) {
+                    max_batch_items = std::max<size_t>(1, (batch_end - batch_begin) / 2);
+                    retry_attempts = 0;
+                    continue;
+                }
+                if ((is_sybil_batch_oom_error(response) || is_sybil_transient_error(response)) &&
+                    retry_attempts < kMaxRetryAttempts) {
+                    ++retry_attempts;
+                    if (is_sybil_transient_error(response)) {
+                        std::this_thread::sleep_for(std::chrono::seconds(std::min<size_t>(retry_attempts, 5)));
+                    }
+                    continue;
+                }
+                if (is_sybil_transient_error(response)) {
+                    std::cerr << "Error: Sybil transient server error";
+                    if (batch_end - batch_begin == 1) {
+                        std::cerr << " for " << items[batch_begin].name;
+                    }
+                    std::cerr << " after " << kMaxRetryAttempts << " retries: "
+                              << response_preview(response) << "\n";
+                    return false;
+                }
+                if (is_sybil_error_response(response)) {
+                    std::cerr << "Error: Sybil server error: " << response_preview(response) << "\n";
+                    return false;
+                }
+                std::cerr << "Error: Sybil response contained " << batch_embeddings.size()
+                          << " embeddings for " << (batch_end - batch_begin) << " inputs\n";
+                std::cerr << "Response preview: " << response_preview(response) << "\n";
+                return false;
+            }
+            embeddings.insert(embeddings.end(), batch_embeddings.begin(), batch_embeddings.end());
+        }
+
+        retry_attempts = 0;
+        batch_begin = batch_end;
+    }
+
+    return true;
 }
 
 //=============================================================================
@@ -1605,6 +2101,14 @@ static bool parse_args(int argc, char* argv[]) {
             }
             g_opts.function_list = split_string(argv[++i]);
         }
+        else if (arg == "--sybil") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --sybil requires an endpoint URL\n";
+                return false;
+            }
+            g_opts.sybil_url = argv[++i];
+            g_opts.sybil_embeddings = true;
+        }
         else if (arg == "-e" || arg == "--errors") {
             g_opts.errors_only = true;
         }
@@ -1690,6 +2194,11 @@ static bool parse_args(int argc, char* argv[]) {
         return false;
     }
 
+    if (g_opts.sybil_embeddings && g_opts.list_functions) {
+        std::cerr << "Error: --sybil cannot be combined with --list\n";
+        return false;
+    }
+
     // If user explicitly selected any outputs, show only those selections.
     if (asm_selected || mc_selected || pseudo_selected) {
         g_opts.show_assembly = asm_selected;
@@ -1725,8 +2234,14 @@ int main(int argc, char *argv[]) {
         g_opts.no_plugins = true;
     }
 
+    if (g_opts.sybil_embeddings) {
+        Color::disable();
+        g_opts.quiet = true;
+        g_opts.no_plugins = true;
+    }
+
     // In file mode, suppress normal console output
-    bool show_console_info = g_opts.output_file.empty() && !g_opts.quiet;
+    bool show_console_info = g_opts.output_file.empty() && !g_opts.quiet && !g_opts.sybil_embeddings;
 
     HighlighterGuard highlighter_guard;
 
@@ -1781,7 +2296,47 @@ int main(int argc, char *argv[]) {
             std::cout << "[*] Processing " << g_stats.total_functions << " functions...\n";
         }
 
-        if (g_opts.list_functions) {
+        if (g_opts.sybil_embeddings) {
+            std::vector<SybilFunctionInput> sybil_inputs;
+            sybil_inputs.reserve(g_stats.functions_to_process);
+
+            for (size_t i = 0; i < g_stats.total_functions; ++i) {
+                func_t *pfn = getn_func(i);
+                if (!pfn) continue;
+
+                qstring fname;
+                get_func_name(&fname, pfn->start_ea);
+
+                SybilFunctionInput item;
+                bool collected = FunctionDumper::collect_sybil_input(pfn, item);
+                if (collected) {
+                    sybil_inputs.push_back(std::move(item));
+                }
+
+                if (collected && !g_opts.output_file.empty()) {
+                    g_stats.processed = g_stats.decompiled_ok + g_stats.decompiled_fail;
+                    g_progress.update(g_stats.processed, fname.c_str());
+                }
+            }
+
+            if (!g_opts.output_file.empty()) {
+                g_progress.finish();
+            }
+
+            if (sybil_inputs.empty()) {
+                std::cerr << "Error: No functions available for Sybil embedding request\n";
+                return EXIT_FAILURE;
+            }
+
+            std::vector<std::string> embeddings;
+            if (!request_sybil_embeddings(sybil_inputs, embeddings)) {
+                return EXIT_FAILURE;
+            }
+
+            if (!g_opts.output_file.empty()) {
+                write_sybil_export(sybil_inputs, embeddings);
+            }
+        } else if (g_opts.list_functions) {
             // List mode - just show function names
             printf("\n  %-16s  %6s  %-20s  %s\n", "Address", "Size", "Flags", "Name");
             printf("  %s  %s  %s  %s\n",
