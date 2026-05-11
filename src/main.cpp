@@ -1208,6 +1208,13 @@ public:
     }
 
 private:
+    static bool use_compact_pseudocode_file_output() {
+        return g_opts.folder_files &&
+               g_opts.show_pseudocode &&
+               !g_opts.show_assembly &&
+               !g_opts.show_microcode;
+    }
+
     static void print_header(func_t *pfn, const char* fname, bool success) {
 
         // Get segment name
@@ -1215,12 +1222,22 @@ private:
         segment_t* seg = getseg(pfn->start_ea);
         if (seg) get_segm_name(&seg_name, seg);
 
-        out << "\n";
-        out << CLR(Bold) << std::string(78, '=') << CLR(Reset) << "\n";
-
         // Function name with status indicator
         const char* status_color = success ? CLR(Green) : CLR(Red);
         const char* status_icon = success ? "[OK]" : "[FAIL]";
+
+        if (use_compact_pseudocode_file_output()) {
+            out << "// Function: " << fname;
+            if (!seg_name.empty()) {
+                out << " (" << seg_name.c_str() << ":"
+                    << format_address(pfn->start_ea) << ")";
+            }
+            out << "  " << status_icon << "\n";
+            return;
+        }
+
+        out << "\n";
+        out << CLR(Bold) << std::string(78, '=') << CLR(Reset) << "\n";
 
         out << CLR(Bold) << "Function: " << CLR(Cyan) << fname << CLR(Reset);
         if (!seg_name.empty()) {
@@ -1274,12 +1291,14 @@ private:
     }
 
     static void dump_pseudocode(cfunc_t *cfunc) {
-        out << CLR(Yellow) << "-- Pseudocode " << CLR(Dim) << std::string(63, '-') << CLR(Reset) << "\n";
+        if (!use_compact_pseudocode_file_output()) {
+            out << CLR(Yellow) << "-- Pseudocode " << CLR(Dim) << std::string(63, '-') << CLR(Reset) << "\n";
+        }
         std::string formatted = collect_pseudocode(cfunc);
         std::istringstream stream(formatted);
         std::string line;
         while (std::getline(stream, line)) {
-            if (!g_opts.output_file.empty()) {
+            if (!g_opts.output_file.empty() || g_opts.folder_files) {
                 // No highlighting for file output
                 out << line << "\n";
             } else {
@@ -2958,20 +2977,16 @@ int main(int argc, char *argv[]) {
     if (!g_opts.output_file.empty()) {
         // Disable colors for file output
         Color::disable();
-        // Auto-enable quiet mode and no-plugins for file output
         g_opts.quiet = true;
-        g_opts.no_plugins = true;
     }
     if (g_opts.folder_files) {
         Color::disable();
         g_opts.quiet = true;
-        g_opts.no_plugins = true;
     }
 
     if (g_opts.sybil_embeddings) {
         Color::disable();
         g_opts.quiet = true;
-        g_opts.no_plugins = true;
     }
 
     // In file mode, suppress normal console output
