@@ -1386,7 +1386,7 @@ static std::string to_lower_copy(std::string text) {
 
 static bool has_source_file_extension(const std::string &name) {
     static const char *exts[] = {
-        ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
+        ".c", ".cc", ".cpp", ".cxx", ".tcc", ".h", ".hh", ".hpp", ".hxx",
         ".asm", ".s", ".inc", ".mc", ".txt"
     };
     std::string lower = to_lower_copy(name);
@@ -1475,40 +1475,73 @@ static std::filesystem::path unique_output_path(
     return chosen;
 }
 
-static std::filesystem::path fallback_function_output_path(
-        const FunctionEntry &entry,
-        const std::vector<std::string> &parts) {
-    std::filesystem::path rel = build_sanitized_relative_path(parts, 0, parts.size());
-    std::string fname = sanitize_path_component(entry.name, "function");
-    std::string addr = sanitize_path_component(format_address(entry.start_ea), "addr");
-    rel /= fname + "_" + addr + default_export_extension();
-    return std::filesystem::path(g_opts.output_dir) / rel;
+static std::string folder_key(const std::vector<std::string> &parts, size_t end) {
+    std::string key;
+    for (size_t i = 0; i < end; ++i) {
+        key += "/";
+        key += parts[i];
+    }
+    return key.empty() ? "/" : key;
 }
 
-static std::filesystem::path folder_file_output_path(
-        const FunctionEntry &entry,
-        const std::string &abs_path,
-        std::unordered_map<std::string, std::filesystem::path> &key_to_path,
-        std::unordered_map<std::string, size_t> &path_counts) {
-    std::vector<std::string> parts = split_tree_path(abs_path);
-    if (!parts.empty()) parts.pop_back(); // Drop the function item name.
-
+static bool find_source_file_ancestor(const std::vector<std::string> &parts,
+                                      size_t &source_end) {
     for (size_t i = parts.size(); i > 0; --i) {
         if (!has_source_file_extension(parts[i - 1])) continue;
+        source_end = i;
+        return true;
+    }
+    return false;
+}
 
-        std::filesystem::path rel = build_sanitized_relative_path(parts, 0, i - 1);
-        rel /= sanitize_path_component(parts[i - 1], "source.txt");
-        std::filesystem::path desired = std::filesystem::path(g_opts.output_dir) / rel;
+static std::filesystem::path source_file_output_path(
+        const std::vector<std::string> &parts,
+        size_t source_end,
+        std::unordered_map<std::string, std::filesystem::path> &key_to_path,
+        std::unordered_map<std::string, size_t> &path_counts) {
+    std::filesystem::path rel = build_sanitized_relative_path(parts, 0, source_end - 1);
+    rel /= sanitize_path_component(parts[source_end - 1], "source.txt");
+    std::filesystem::path desired = std::filesystem::path(g_opts.output_dir) / rel;
+    return unique_output_path(desired, key_to_path, path_counts,
+                              "source:" + folder_key(parts, source_end));
+}
 
-        std::string stable_key;
-        for (size_t j = 0; j < i; ++j) {
-            stable_key += "/";
-            stable_key += parts[j];
-        }
-        return unique_output_path(desired, key_to_path, path_counts, stable_key);
+static std::filesystem::path folder_aggregate_output_path(
+        const std::vector<std::string> &parts,
+        std::unordered_map<std::string, std::filesystem::path> &key_to_path,
+        std::unordered_map<std::string, size_t> &path_counts) {
+    std::filesystem::path rel;
+    std::string filename;
+    if (parts.empty()) {
+        filename = "root" + default_export_extension();
+    } else {
+        rel = build_sanitized_relative_path(parts, 0, parts.size() - 1);
+        filename = sanitize_path_component(parts.back(), "folder") + default_export_extension();
     }
 
-    return fallback_function_output_path(entry, parts);
+    std::filesystem::path desired = std::filesystem::path(g_opts.output_dir) / rel / filename;
+    return unique_output_path(desired, key_to_path, path_counts,
+                              "folder:" + folder_key(parts, parts.size()));
+}
+
+static void assign_folder_file_output_paths(std::vector<FunctionEntry> &plan) {
+    std::unordered_map<std::string, std::filesystem::path> key_to_path;
+    std::unordered_map<std::string, size_t> path_counts;
+
+    for (auto &entry : plan) {
+        std::vector<std::string> parts = split_tree_path(entry.tree_path);
+        if (!parts.empty()) parts.pop_back(); // Drop the function item name.
+
+        size_t source_end = 0;
+        if (find_source_file_ancestor(parts, source_end)) {
+            entry.output_path = source_file_output_path(
+                parts, source_end, key_to_path, path_counts);
+            continue;
+        }
+
+        entry.output_path = folder_aggregate_output_path(
+            parts, key_to_path, path_counts);
+    }
 }
 
 static std::vector<FunctionEntry> collect_export_plan() {
@@ -1544,14 +1577,9 @@ static std::vector<FunctionEntry> collect_folder_file_export_plan() {
         return plan;
     }
 
-    std::unordered_map<std::string, std::filesystem::path> key_to_path;
-    std::unordered_map<std::string, size_t> path_counts;
-
     struct Visitor : public dirtree_visitor_t {
         dirtree_t *dt = nullptr;
         std::vector<FunctionEntry> *plan = nullptr;
-        std::unordered_map<std::string, std::filesystem::path> *key_to_path = nullptr;
-        std::unordered_map<std::string, size_t> *path_counts = nullptr;
 
         ssize_t visit(const dirtree_cursor_t &cursor, const direntry_t &de) override {
             if (!dirtree_t::isfile(de)) return 0;
@@ -1575,8 +1603,6 @@ static std::vector<FunctionEntry> collect_folder_file_export_plan() {
             entry.start_ea = pfn->start_ea;
             entry.end_ea = pfn->end_ea;
             entry.tree_path = abs_path.c_str();
-            entry.output_path = folder_file_output_path(
-                entry, entry.tree_path, *key_to_path, *path_counts);
             plan->push_back(std::move(entry));
             return 0;
         }
@@ -1585,9 +1611,8 @@ static std::vector<FunctionEntry> collect_folder_file_export_plan() {
     Visitor visitor;
     visitor.dt = dt;
     visitor.plan = &plan;
-    visitor.key_to_path = &key_to_path;
-    visitor.path_counts = &path_counts;
     dt->traverse(visitor);
+    assign_folder_file_output_paths(plan);
 
     return plan;
 }
@@ -1601,10 +1626,10 @@ static std::vector<FunctionEntry> collect_active_export_plan() {
         std::cerr << "\033[33mWarning: Function folder tree is empty; "
                   << "falling back to flat function order.\033[0m\n";
         plan = collect_export_plan();
-        std::vector<std::string> no_parts;
         for (auto &entry : plan) {
-            entry.output_path = fallback_function_output_path(entry, no_parts);
+            entry.tree_path = "/" + entry.name;
         }
+        assign_folder_file_output_paths(plan);
         return plan;
     }
     return collect_export_plan();

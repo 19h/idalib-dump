@@ -112,8 +112,10 @@ Manual continuation with `--start-index`/`--offset` and `-o`/`-O` appends to
 existing output by default.
 
 With `--output-dir`/`--folder-files`, IDA's function folder tree is mirrored on
-disk. Source-like folder names such as `foo.cpp`, `bar.c`, or `init.asm` become
+disk. Source-like folder names such as `foo.cpp`, `bar.tcc`, or `init.asm` become
 aggregate files containing the functions below them in folder order. The
+functions directly under a non-source folder are grouped into `<folder>.c` (or
+the active output extension); root functions are grouped into `root.c`.
 directory export writes a checkpoint at `<output-dir>/.idalib-dump.progress`
 and resumes from the last complete function on rerun.
 
