@@ -31,6 +31,7 @@
 #include <chrono>
 #include <iomanip>
 #include <thread>
+#include <limits>
 
 // Save real setenv/getenv and FILE* pointers before IDA SDK redefines them with macros
 static inline int real_setenv(const char* name, const char* value) {
@@ -78,6 +79,7 @@ static inline int current_process_id() { return _getpid(); }
 #define O_WRONLY _O_WRONLY
 #else
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -141,6 +143,8 @@ struct Options {
     ea_t filter_address = BADADDR;   // Filter by specific address
     std::vector<std::string> function_list;  // Explicit list of functions (names or addresses)
     std::vector<std::string> plugin_patterns;  // Additional plugins to load in no-plugins mode
+    size_t start_index = 0;          // First exporter-order function index to process
+    size_t max_functions = std::numeric_limits<size_t>::max();  // Max functions to process
     bool show_assembly = true;
     bool show_microcode = false;
     bool show_pseudocode = true;
@@ -152,6 +156,8 @@ struct Options {
     bool verbose = false;            // Show extra metadata
     bool no_plugins = false;         // Disable loading user plugins
     bool sybil_embeddings = false;   // Hidden: request embeddings instead of dumping
+    bool start_index_set = false;    // User explicitly set --start-index/--offset
+    bool resume = true;              // Resume file exports from a checkpoint when possible
 };
 
 static Options g_opts;
@@ -356,6 +362,17 @@ public:
 };
 
 static OutputWriter out;
+
+static bool open_output_file(std::ios::openmode mode = std::ios::trunc) {
+    g_output_file = std::make_unique<std::ofstream>(
+        g_opts.output_file, std::ios::out | std::ios::binary | mode);
+    if (!g_output_file->is_open()) {
+        std::cerr << "Error: Cannot open output file: " << g_opts.output_file << "\n";
+        return false;
+    }
+    g_output = g_output_file.get();
+    return true;
+}
 
 //=============================================================================
 // ANSI Colors (for terminal output)
@@ -1134,13 +1151,11 @@ public:
         return true;
     }
 
-    static void list(func_t *pfn) {
+    static void list(func_t *pfn, size_t index) {
         if (!pfn) return;
 
         qstring fname;
         get_func_name(&fname, pfn->start_ea);
-
-        if (!matches_filter(fname.c_str(), pfn->start_ea)) return;
 
         // Get function flags
         std::string flags;
@@ -1149,7 +1164,8 @@ public:
         if (pfn->flags & FUNC_THUNK) flags += "thunk ";
         if (pfn->flags & FUNC_LUMINA) flags += "lumina ";
 
-        printf("  %-16s  %6zu  %-20s  %s\n",
+        printf("  %8zu  %-16s  %6zu  %-20s  %s\n",
+               index,
                format_address(pfn->start_ea).c_str(),
                (size_t)(pfn->end_ea - pfn->start_ea),
                flags.c_str(),
@@ -1279,6 +1295,225 @@ private:
         return format_pseudocode_block(pseudo_block);
     }
 };
+
+//=============================================================================
+// Export Plan and Resume State
+//=============================================================================
+
+struct FunctionEntry {
+    size_t index = 0;       // Index in the filtered exporter order
+    func_t *pfn = nullptr;
+    std::string name;
+    ea_t start_ea = BADADDR;
+    ea_t end_ea = BADADDR;
+};
+
+struct FunctionRange {
+    size_t begin = 0;       // Inclusive index into the export plan
+    size_t end = 0;         // Exclusive index into the export plan
+
+    size_t size() const {
+        return end > begin ? end - begin : 0;
+    }
+};
+
+struct ResumeState {
+    bool valid = false;
+    size_t next_index = 0;      // Next exporter-order index to process
+    uintmax_t output_size = 0;  // Last complete output-file byte boundary
+};
+
+static std::vector<FunctionEntry> collect_export_plan() {
+    std::vector<FunctionEntry> plan;
+    plan.reserve(g_stats.total_functions);
+
+    for (size_t i = 0; i < g_stats.total_functions; ++i) {
+        func_t *pfn = getn_func(i);
+        if (!pfn) continue;
+
+        qstring fname;
+        get_func_name(&fname, pfn->start_ea);
+        if (!FunctionDumper::should_process(pfn, fname.c_str())) {
+            continue;
+        }
+
+        FunctionEntry entry;
+        entry.index = plan.size();
+        entry.pfn = pfn;
+        entry.name = fname.c_str();
+        entry.start_ea = pfn->start_ea;
+        entry.end_ea = pfn->end_ea;
+        plan.push_back(std::move(entry));
+    }
+
+    return plan;
+}
+
+static FunctionRange selected_function_range(size_t plan_size) {
+    FunctionRange range;
+    range.begin = std::min(g_opts.start_index, plan_size);
+    if (g_opts.max_functions == std::numeric_limits<size_t>::max()) {
+        range.end = plan_size;
+    } else {
+        size_t available = plan_size - range.begin;
+        range.end = range.begin + std::min(g_opts.max_functions, available);
+    }
+    return range;
+}
+
+static void hash_byte(uint64_t &hash, unsigned char value) {
+    hash ^= value;
+    hash *= 1099511628211ULL;
+}
+
+static void hash_text(uint64_t &hash, const std::string &text) {
+    for (unsigned char c : text) {
+        hash_byte(hash, c);
+    }
+    hash_byte(hash, 0xff);
+}
+
+static std::string export_plan_signature(const std::vector<FunctionEntry> &plan,
+                                         const FunctionRange &range) {
+    uint64_t hash = 1469598103934665603ULL;
+
+    hash_text(hash, g_opts.input_file);
+    hash_text(hash, g_opts.filter_pattern);
+    for (const auto &item : g_opts.function_list) hash_text(hash, item);
+    hash_text(hash, format_address(g_opts.filter_address));
+    hash_text(hash, g_opts.show_assembly ? "asm" : "no-asm");
+    hash_text(hash, g_opts.show_microcode ? "mc" : "no-mc");
+    hash_text(hash, g_opts.show_pseudocode ? "pseudo" : "no-pseudo");
+    hash_text(hash, g_opts.format_pseudocode ? "format" : "no-format");
+    hash_text(hash, g_opts.errors_only ? "errors-only" : "all");
+    hash_text(hash, std::to_string(g_opts.start_index));
+    hash_text(hash, std::to_string(g_opts.max_functions));
+    hash_text(hash, std::to_string(plan.size()));
+    hash_text(hash, std::to_string(range.begin));
+    hash_text(hash, std::to_string(range.end));
+
+    for (size_t i = range.begin; i < range.end; ++i) {
+        const auto &entry = plan[i];
+        hash_text(hash, entry.name);
+        hash_text(hash, format_address(entry.start_ea));
+        hash_text(hash, format_address(entry.end_ea));
+    }
+
+    std::ostringstream oss;
+    oss << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return oss.str();
+}
+
+static std::filesystem::path checkpoint_path_for_output() {
+    return std::filesystem::path(g_opts.output_file + ".progress");
+}
+
+static bool parse_size_value(const std::string &text, size_t &value) {
+    try {
+        size_t pos = 0;
+        unsigned long long parsed = std::stoull(text, &pos, 10);
+        if (pos != text.size()) return false;
+        value = static_cast<size_t>(parsed);
+        return parsed == static_cast<unsigned long long>(value);
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool parse_uintmax_value(const std::string &text, uintmax_t &value) {
+    try {
+        size_t pos = 0;
+        unsigned long long parsed = std::stoull(text, &pos, 10);
+        if (pos != text.size()) return false;
+        value = static_cast<uintmax_t>(parsed);
+        return parsed == static_cast<unsigned long long>(value);
+    } catch (...) {
+        return false;
+    }
+}
+
+static ResumeState read_resume_state(const std::filesystem::path &path,
+                                     const std::string &signature,
+                                     const FunctionRange &range) {
+    ResumeState state;
+    std::ifstream file(path);
+    if (!file) return state;
+
+    std::string line;
+    std::string checkpoint_signature;
+    bool have_next_index = false;
+    bool have_output_size = false;
+    while (std::getline(file, line)) {
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq);
+        std::string value = line.substr(eq + 1);
+        if (key == "signature") {
+            checkpoint_signature = value;
+        } else if (key == "next_index") {
+            have_next_index = parse_size_value(value, state.next_index);
+        } else if (key == "output_size") {
+            have_output_size = parse_uintmax_value(value, state.output_size);
+        }
+    }
+
+    if (checkpoint_signature != signature) {
+        return ResumeState{};
+    }
+    if (!have_next_index || !have_output_size) {
+        return ResumeState{};
+    }
+    if (state.next_index < range.begin || state.next_index > range.end) {
+        return ResumeState{};
+    }
+    if (state.output_size > static_cast<uintmax_t>(std::numeric_limits<size_t>::max())) {
+        return ResumeState{};
+    }
+
+    std::error_code ec;
+    uintmax_t actual_size = std::filesystem::file_size(g_opts.output_file, ec);
+    if (ec || actual_size < state.output_size) {
+        return ResumeState{};
+    }
+
+    state.valid = true;
+    return state;
+}
+
+static void write_resume_state(const std::filesystem::path &path,
+                               const std::string &signature,
+                               size_t next_index,
+                               uintmax_t output_size,
+                               const FunctionRange &range) {
+    std::filesystem::path tmp_path = path;
+    tmp_path += ".tmp";
+
+    {
+        std::ofstream file(tmp_path, std::ios::out | std::ios::trunc | std::ios::binary);
+        if (!file) return;
+        file << "version=1\n";
+        file << "signature=" << signature << "\n";
+        file << "next_index=" << next_index << "\n";
+        file << "output_size=" << output_size << "\n";
+        file << "range_begin=" << range.begin << "\n";
+        file << "range_end=" << range.end << "\n";
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    ec.clear();
+    std::filesystem::rename(tmp_path, path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp_path, ec);
+    }
+}
+
+static uintmax_t current_output_size() {
+    if (!g_output_file) return g_stats.output_bytes;
+    auto pos = g_output_file->tellp();
+    if (pos == std::ostream::pos_type(-1)) return g_stats.output_bytes;
+    return static_cast<uintmax_t>(pos);
+}
 
 //=============================================================================
 // Summary
@@ -1462,7 +1697,17 @@ static bool run_curl_post_json(const std::string &url,
     std::filesystem::remove(tmp_path);
 
     if (rc != 0) {
+#ifdef _WIN32
         error = "curl exited with status " + std::to_string(rc);
+#else
+        if (WIFEXITED(rc)) {
+            error = "curl exited with status " + std::to_string(WEXITSTATUS(rc));
+        } else if (WIFSIGNALED(rc)) {
+            error = "curl terminated by signal " + std::to_string(WTERMSIG(rc));
+        } else {
+            error = "curl exited with status " + std::to_string(rc);
+        }
+#endif
         return false;
     }
     return true;
@@ -1665,7 +1910,13 @@ static bool request_sybil_embeddings(const std::vector<SybilFunctionInput> &item
         std::string response;
         std::string error;
         std::string request_json = build_sybil_request_json(items, batch_begin, batch_end);
+        if (!g_opts.output_file.empty()) {
+            std::cerr << "\r\033[KSybil request " << (batch_begin + 1)
+                      << "-" << batch_end << "/" << items.size() << "..."
+                      << std::flush;
+        }
         if (!run_curl_post_json(endpoint_url, request_json, response, error)) {
+            if (!g_opts.output_file.empty()) std::cerr << "\n";
             std::cerr << "Error: Sybil request failed: " << error << "\n";
             return false;
         }
@@ -1954,8 +2205,16 @@ public:
     }
 
     ~HeadlessIdaContext() {
+        shutdown();
+    }
+
+    void shutdown() {
+        if (m_shutdown) return;
+        m_shutdown = true;
+
         if (g_hexrays_available) {
             term_hexrays_plugin();
+            g_hexrays_available = false;
         }
         set_database_flag(DBFL_KILL);
         term_database();
@@ -1972,6 +2231,7 @@ public:
 
 private:
     std::string m_fake_idadir_base;  // Path to clean up on destruction
+    bool m_shutdown = false;
 };
 
 //=============================================================================
@@ -2016,7 +2276,11 @@ static void print_usage(const char* prog) {
     std::cout << "  -F, --functions <list>   List of functions (comma or pipe separated)\n";
     std::cout << "  -a, --address <addr>     Show only function at address (hex)\n";
     std::cout << "  -e, --errors             Show only functions with decompilation errors\n";
-    std::cout << "  -l, --list               List functions only (no decompilation)\n";
+    std::cout << "  -l, --list               List exporter-order indexes (no decompilation)\n";
+    std::cout << "  --start-index <n>        Start at exporter-order index n; appends with -o\n";
+    std::cout << "  --offset <n>             Alias for --start-index\n";
+    std::cout << "  --count <n>              Process at most n functions from the start index\n";
+    std::cout << "  --limit <n>              Alias for --count\n";
     std::cout << "  -q, --quiet              Suppress IDA's verbose messages\n";
     std::cout << "  -v, --verbose            Show extra metadata for each function\n";
     std::cout << "  --asm                    Show assembly\n";
@@ -2031,6 +2295,7 @@ static void print_usage(const char* prog) {
     std::cout << "  --pseudo-only            Show only pseudocode\n";
     std::cout << "  --no-color               Disable colored output\n";
     std::cout << "  --no-summary             Don't show summary at end\n";
+    std::cout << "  --no-resume              Disable checkpoint resume for file exports\n";
     std::cout << "  --no-plugins             Don't load user plugins (keeps IDA built-in plugins)\n";
     std::cout << "  --plugin <pattern>       Also load user plugins matching pattern (comma-separated)\n";
     std::cout << "                           Implies --no-plugins. Can be specified multiple times\n";
@@ -2042,8 +2307,9 @@ static void print_usage(const char* prog) {
     std::cout << "  " << prog << " -f main program.exe                # Only 'main' function\n";
     std::cout << "  " << prog << " -F main,foo,bar program.exe        # Specific functions by name\n";
     std::cout << "  " << prog << " -o out.c --pseudo-only program.exe # Export to file with progress\n";
+    std::cout << "  " << prog << " -l program.exe                     # List exporter-order indexes\n";
+    std::cout << "  " << prog << " -o out.c --start-index 100 --count 50 program.exe\n";
     std::cout << "  " << prog << " -e program.exe                     # Only show errors\n";
-    std::cout << "  " << prog << " -l program.exe                     # List functions\n";
     std::cout << "\n";
 }
 
@@ -2115,6 +2381,31 @@ static bool parse_args(int argc, char* argv[]) {
         else if (arg == "-l" || arg == "--list") {
             g_opts.list_functions = true;
         }
+        else if (arg == "--start-index" || arg == "--offset") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << arg << " requires a non-negative integer\n";
+                return false;
+            }
+            size_t value = 0;
+            if (!parse_size_value(argv[++i], value)) {
+                std::cerr << "Error: " << arg << " requires a non-negative integer\n";
+                return false;
+            }
+            g_opts.start_index = value;
+            g_opts.start_index_set = true;
+        }
+        else if (arg == "--count" || arg == "--limit") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << arg << " requires a non-negative integer\n";
+                return false;
+            }
+            size_t value = 0;
+            if (!parse_size_value(argv[++i], value)) {
+                std::cerr << "Error: " << arg << " requires a non-negative integer\n";
+                return false;
+            }
+            g_opts.max_functions = value;
+        }
         else if (arg == "-q" || arg == "--quiet") {
             g_opts.quiet = true;
         }
@@ -2162,6 +2453,9 @@ static bool parse_args(int argc, char* argv[]) {
         }
         else if (arg == "--no-summary") {
             g_opts.show_summary = false;
+        }
+        else if (arg == "--no-resume") {
+            g_opts.resume = false;
         }
         else if (arg == "--no-plugins") {
             g_opts.no_plugins = true;
@@ -2219,14 +2513,9 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Set up output file if specified
+    // File output is opened after the export plan is known, so checkpoint resume
+    // can validate the same function order before truncating or appending.
     if (!g_opts.output_file.empty()) {
-        g_output_file = std::make_unique<std::ofstream>(g_opts.output_file);
-        if (!g_output_file->is_open()) {
-            std::cerr << "Error: Cannot open output file: " << g_opts.output_file << "\n";
-            return EXIT_FAILURE;
-        }
-        g_output = g_output_file.get();
         // Disable colors for file output
         Color::disable();
         // Auto-enable quiet mode and no-plugins for file output
@@ -2242,6 +2531,7 @@ int main(int argc, char *argv[]) {
 
     // In file mode, suppress normal console output
     bool show_console_info = g_opts.output_file.empty() && !g_opts.quiet && !g_opts.sybil_embeddings;
+    bool sybil_completed = false;
 
     HighlighterGuard highlighter_guard;
 
@@ -2258,74 +2548,60 @@ int main(int argc, char *argv[]) {
         }
 
         g_stats.total_functions = get_func_qty();
+        std::vector<FunctionEntry> export_plan = collect_export_plan();
+        FunctionRange function_range = selected_function_range(export_plan.size());
+        g_stats.functions_to_process = function_range.size();
+        g_progress.set_total(g_stats.functions_to_process);
 
-        // Count functions to process (for progress display)
-        if (!g_opts.output_file.empty()) {
-            size_t count = 0;
-            for (size_t i = 0; i < g_stats.total_functions; ++i) {
-                func_t *pfn = getn_func(i);
-                if (pfn) {
-                    qstring fname;
-                    get_func_name(&fname, pfn->start_ea);
-                    if (FunctionDumper::should_process(pfn, fname.c_str())) {
-                        count++;
-                    }
+        // Warn if no functions matched the filter
+        if (export_plan.empty() &&
+            (!g_opts.function_list.empty() || !g_opts.filter_pattern.empty() || g_opts.filter_address != BADADDR)) {
+            std::cerr << "\033[33mWarning: No functions matched the filter.\033[0m\n";
+            if (!g_opts.function_list.empty()) {
+                std::cerr << "\033[90mSearched for: ";
+                for (size_t i = 0; i < g_opts.function_list.size() && i < 5; ++i) {
+                    if (i > 0) std::cerr << ", ";
+                    std::cerr << g_opts.function_list[i];
                 }
-            }
-            g_stats.functions_to_process = count;
-            g_progress.set_total(count);
-
-            // Warn if no functions matched the filter
-            if (count == 0 && (!g_opts.function_list.empty() || !g_opts.filter_pattern.empty() || g_opts.filter_address != BADADDR)) {
-                std::cerr << "\033[33mWarning: No functions matched the filter.\033[0m\n";
-                if (!g_opts.function_list.empty()) {
-                    std::cerr << "\033[90mSearched for: ";
-                    for (size_t i = 0; i < g_opts.function_list.size() && i < 5; ++i) {
-                        if (i > 0) std::cerr << ", ";
-                        std::cerr << g_opts.function_list[i];
-                    }
-                    if (g_opts.function_list.size() > 5) {
-                        std::cerr << " (+" << (g_opts.function_list.size() - 5) << " more)";
-                    }
-                    std::cerr << "\033[0m\n";
+                if (g_opts.function_list.size() > 5) {
+                    std::cerr << " (+" << (g_opts.function_list.size() - 5) << " more)";
                 }
+                std::cerr << "\033[0m\n";
             }
         }
 
         if (show_console_info) {
-            std::cout << "[*] Processing " << g_stats.total_functions << " functions...\n";
+            std::cout << "[*] Processing " << g_stats.functions_to_process
+                      << " of " << export_plan.size() << " matching functions...\n";
         }
 
         if (g_opts.sybil_embeddings) {
             std::vector<SybilFunctionInput> sybil_inputs;
-            sybil_inputs.reserve(g_stats.functions_to_process);
+            sybil_inputs.reserve(function_range.size());
 
-            for (size_t i = 0; i < g_stats.total_functions; ++i) {
-                func_t *pfn = getn_func(i);
-                if (!pfn) continue;
-
-                qstring fname;
-                get_func_name(&fname, pfn->start_ea);
+            for (size_t i = function_range.begin; i < function_range.end; ++i) {
+                const FunctionEntry &entry = export_plan[i];
 
                 SybilFunctionInput item;
-                bool collected = FunctionDumper::collect_sybil_input(pfn, item);
+                bool collected = FunctionDumper::collect_sybil_input(entry.pfn, item);
                 if (collected) {
                     sybil_inputs.push_back(std::move(item));
                 }
 
-                if (collected && !g_opts.output_file.empty()) {
-                    g_stats.processed = g_stats.decompiled_ok + g_stats.decompiled_fail;
-                    g_progress.update(g_stats.processed, fname.c_str());
+                if (!g_opts.output_file.empty()) {
+                    g_stats.processed = (i + 1) - function_range.begin;
+                    g_progress.update(g_stats.processed, entry.name);
                 }
-            }
-
-            if (!g_opts.output_file.empty()) {
-                g_progress.finish();
             }
 
             if (sybil_inputs.empty()) {
                 std::cerr << "Error: No functions available for Sybil embedding request\n";
                 return EXIT_FAILURE;
+            }
+
+            if (!g_opts.output_file.empty()) {
+                std::cerr << "\r\033[KCollected " << sybil_inputs.size()
+                          << " functions; requesting Sybil embeddings...\n";
             }
 
             std::vector<std::string> embeddings;
@@ -2334,44 +2610,135 @@ int main(int argc, char *argv[]) {
             }
 
             if (!g_opts.output_file.empty()) {
+                if (!open_output_file()) {
+                    return EXIT_FAILURE;
+                }
                 write_sybil_export(sybil_inputs, embeddings);
+                g_output_file->flush();
+                if (!*g_output_file) {
+                    std::cerr << "Error: Failed to write output file: "
+                              << g_opts.output_file << "\n";
+                    return EXIT_FAILURE;
+                }
+                g_progress.finish();
             }
+            sybil_completed = true;
+            std::cout.flush();
+            std::cerr.flush();
+            if (g_output_file) {
+                g_output_file->close();
+                g_output_file.reset();
+            }
+            real_fflush(real_stdout);
+            real_fflush(real_stderr);
+            _exit(0);
         } else if (g_opts.list_functions) {
-            // List mode - just show function names
-            printf("\n  %-16s  %6s  %-20s  %s\n", "Address", "Size", "Flags", "Name");
-            printf("  %s  %s  %s  %s\n",
+            // List mode - show the exact filtered order used by the exporter.
+            printf("\n  %8s  %-16s  %6s  %-20s  %s\n", "Index", "Address", "Size", "Flags", "Name");
+            printf("  %s  %s  %s  %s  %s\n",
+                   std::string(8, '-').c_str(),
                    std::string(16, '-').c_str(),
                    std::string(6, '-').c_str(),
                    std::string(20, '-').c_str(),
                    std::string(30, '-').c_str());
 
-            for (size_t i = 0; i < g_stats.total_functions; ++i) {
-                func_t *pfn = getn_func(i);
-                if (pfn) FunctionDumper::list(pfn);
+            for (size_t i = function_range.begin; i < function_range.end; ++i) {
+                FunctionDumper::list(export_plan[i].pfn, export_plan[i].index);
             }
             std::cout << "\n";
         } else {
-            // Normal mode - dump functions
-            for (size_t i = 0; i < g_stats.total_functions; ++i) {
-                func_t *pfn = getn_func(i);
-                if (pfn) {
-                    // Get function name for progress display
-                    qstring fname;
-                    get_func_name(&fname, pfn->start_ea);
+            size_t dump_begin = function_range.begin;
+            std::filesystem::path checkpoint_path;
+            std::string checkpoint_signature;
+            bool checkpoint_enabled = !g_opts.output_file.empty() && g_opts.resume;
 
-                    FunctionDumper::dump(pfn);
+            if (!g_opts.output_file.empty()) {
+                bool append_from_explicit_offset = g_opts.start_index_set && function_range.begin > 0;
+                std::ios::openmode output_mode =
+                    append_from_explicit_offset ? std::ios::app : std::ios::trunc;
+                checkpoint_path = checkpoint_path_for_output();
+                checkpoint_signature = export_plan_signature(export_plan, function_range);
+                bool resumed_from_checkpoint = false;
 
-                    // Update progress (only counts processed, not skipped)
-                    if (!g_opts.output_file.empty()) {
-                        g_stats.processed = g_stats.decompiled_ok + g_stats.decompiled_fail;
-                        g_progress.update(g_stats.processed, fname.c_str());
+                if (checkpoint_enabled) {
+                    ResumeState state = read_resume_state(
+                        checkpoint_path, checkpoint_signature, function_range);
+                    if (state.valid) {
+                        resumed_from_checkpoint = true;
+                        dump_begin = state.next_index;
+                        g_stats.output_bytes = static_cast<size_t>(state.output_size);
+
+                        if (dump_begin >= function_range.end) {
+                            std::cerr << "\r\033[KExport already complete; removing checkpoint "
+                                      << checkpoint_path.string() << "\n";
+                            std::error_code ec;
+                            std::filesystem::remove(checkpoint_path, ec);
+                            return EXIT_SUCCESS;
+                        }
+
+                        std::error_code ec;
+                        std::filesystem::resize_file(g_opts.output_file, state.output_size, ec);
+                        if (ec) {
+                            std::cerr << "Error: Cannot truncate output file for resume: "
+                                      << ec.message() << "\n";
+                            return EXIT_FAILURE;
+                        }
+                        output_mode = std::ios::app;
+                        g_stats.processed = dump_begin - function_range.begin;
+                        std::cerr << "\r\033[KResuming " << g_opts.output_file
+                                  << " at function index " << dump_begin
+                                  << " (" << g_stats.processed << "/"
+                                  << function_range.size() << " complete)\n";
                     }
+                } else {
+                    std::error_code ec;
+                    std::filesystem::remove(checkpoint_path, ec);
+                }
+
+                if (append_from_explicit_offset && !resumed_from_checkpoint) {
+                    std::error_code ec;
+                    uintmax_t output_size = std::filesystem::file_size(g_opts.output_file, ec);
+                    if (!ec && output_size <= static_cast<uintmax_t>(std::numeric_limits<size_t>::max())) {
+                        g_stats.output_bytes = static_cast<size_t>(output_size);
+                    }
+                    std::cerr << "\r\033[KAppending " << g_opts.output_file
+                              << " from function index " << function_range.begin << "\n";
+                }
+
+                if (!open_output_file(output_mode)) {
+                    return EXIT_FAILURE;
+                }
+            }
+
+            // Normal mode - dump functions
+            for (size_t i = dump_begin; i < function_range.end; ++i) {
+                const FunctionEntry &entry = export_plan[i];
+
+                FunctionDumper::dump(entry.pfn);
+
+                if (!g_opts.output_file.empty()) {
+                    g_output_file->flush();
+                    if (!*g_output_file) {
+                        std::cerr << "\nError: Failed to write output file: "
+                                  << g_opts.output_file << "\n";
+                        return EXIT_FAILURE;
+                    }
+
+                    g_stats.processed = (i + 1) - function_range.begin;
+                    uintmax_t file_size = current_output_size();
+                    if (checkpoint_enabled) {
+                        write_resume_state(checkpoint_path, checkpoint_signature,
+                                           i + 1, file_size, function_range);
+                    }
+                    g_progress.update(g_stats.processed, entry.name);
                 }
             }
 
             // Finish progress display
             if (!g_opts.output_file.empty()) {
                 g_progress.finish();
+                std::error_code ec;
+                std::filesystem::remove(checkpoint_path, ec);
             }
         }
 
@@ -2393,6 +2760,14 @@ int main(int argc, char *argv[]) {
     // Close output file
     if (g_output_file) {
         g_output_file->close();
+    }
+
+    if (g_opts.sybil_embeddings && sybil_completed) {
+        std::cout.flush();
+        std::cerr.flush();
+        real_fflush(real_stdout);
+        real_fflush(real_stderr);
+        _exit(0);
     }
 
     return g_stats.decompiled_fail > 0 ? EXIT_FAILURE : EXIT_SUCCESS;

@@ -83,7 +83,11 @@ By default, assembly and pseudocode are shown. Use these flags to customize:
 | `-F, --functions <list>` | Comma or pipe-separated list of function names/addresses |
 | `-a, --address <hex>` | Show only the function at a specific address |
 | `-e, --errors` | Show only functions that fail to decompile |
-| `-l, --list` | List function names without decompilation |
+| `-l, --list` | List exporter-order function indexes without decompilation |
+| `--start-index <n>` | Start at exporter-order function index `n` (0-based); appends when used with `-o` and `n > 0` |
+| `--offset <n>` | Alias for `--start-index` |
+| `--count <n>` | Process at most `n` functions from the start index |
+| `--limit <n>` | Alias for `--count` |
 
 ### Output Control
 
@@ -95,6 +99,15 @@ By default, assembly and pseudocode are shown. Use these flags to customize:
 | `--no-format-pseudo` | Disable AStyle formatting of pseudocode |
 | `--no-color` | Disable ANSI color output |
 | `--no-summary` | Don't show summary statistics |
+| `--no-resume` | Disable checkpoint resume for file exports |
+
+When dumping to a file with `-o`, `ida_dump` writes a checkpoint sidecar named
+`<output>.progress` after each complete function. If the process crashes, rerun
+the same command and it will validate the same exporter-order function plan,
+truncate the output back to the last complete function boundary, and continue
+from the next function. The checkpoint is removed after a completed export.
+Manual continuation with `--start-index`/`--offset` and `-o` appends to the
+existing output by default.
 
 ### Plugin Control
 
@@ -129,8 +142,11 @@ ida_dump -a 0x140001000 program.exe
 # Find decompilation errors
 ida_dump -e program.exe
 
-# List all functions without decompiling
+# List exporter-order function indexes without decompiling
 ida_dump -l program.exe
+
+# Dump 50 functions starting at exporter-order index 100
+ida_dump -o output.c --pseudo-only --start-index 100 --count 50 program.exe
 
 # Use only Hex-Rays + a specific plugin
 ida_dump --plugin dazhbog program.exe

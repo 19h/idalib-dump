@@ -91,6 +91,31 @@ else()
     set(IDA_LIB_DIR "${IDASDK}/lib/${IDA_LIB_SUFFIX}")
     set(IDA_LIB_PATH "${IDA_LIB_DIR}/${IDA_LIB_NAME}")
     set(IDALIB_PATH "${IDA_LIB_DIR}/${IDALIB_NAME}")
+
+    # Recent Linux SDK dumps may ship compiler-neutral library directories such
+    # as x64_linux_64 instead of x64_linux_clang_64/x64_linux_gcc_64.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       (NOT EXISTS "${IDA_LIB_PATH}" OR NOT EXISTS "${IDALIB_PATH}"))
+        set(_ida_lib_fallbacks
+            "${IDA_ARCH}_${IDA_PLATFORM_NAME}_64"
+            "${IDA_ARCH}_${IDA_PLATFORM_NAME}_gcc_64"
+            "${IDA_ARCH}_${IDA_PLATFORM_NAME}_clang_64")
+
+        foreach(_ida_lib_suffix IN LISTS _ida_lib_fallbacks)
+            set(_ida_candidate_dir "${IDASDK}/lib/${_ida_lib_suffix}")
+            set(_ida_candidate_lib "${_ida_candidate_dir}/${IDA_LIB_NAME}")
+            set(_idalib_candidate_lib "${_ida_candidate_dir}/${IDALIB_NAME}")
+
+            if(EXISTS "${_ida_candidate_lib}" AND EXISTS "${_idalib_candidate_lib}")
+                set(IDA_LIB_SUFFIX "${_ida_lib_suffix}")
+                set(IDA_LIB_DIR "${_ida_candidate_dir}")
+                set(IDA_LIB_PATH "${_ida_candidate_lib}")
+                set(IDALIB_PATH "${_idalib_candidate_lib}")
+                message(STATUS "Using IDA SDK libraries from: ${IDA_LIB_DIR}")
+                break()
+            endif()
+        endforeach()
+    endif()
 endif()
 
 # Create interface targets

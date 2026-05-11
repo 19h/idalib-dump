@@ -783,7 +783,8 @@ private:
             auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 deadline - now).count();
             // Clamp to reasonable poll interval (check every 1 second at most)
-            int poll_timeout = static_cast<int>(std::min(remaining_ms, (long long)1000));
+            int poll_timeout = static_cast<int>(
+                std::min(remaining_ms, decltype(remaining_ms){1000}));
 
             struct pollfd pfd;
             pfd.fd = guard.pipe_fd;
