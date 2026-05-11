@@ -32,6 +32,7 @@
 #include <iomanip>
 #include <thread>
 #include <limits>
+#include <unordered_map>
 
 // Save real setenv/getenv and FILE* pointers before IDA SDK redefines them with macros
 static inline int real_setenv(const char* name, const char* value) {
@@ -123,6 +124,7 @@ extern "C" {
 #include <segment.hpp>
 #include <typeinf.hpp>
 #include <nalt.hpp>
+#include <dirtree.hpp>
 
 //=============================================================================
 // Global State
@@ -138,6 +140,7 @@ static bool g_hexrays_available = false;
 struct Options {
     std::string input_file;
     std::string output_file;         // Output file (empty = stdout)
+    std::string output_dir;          // Folder/file tree export root
     std::string filter_pattern;      // Function name filter (regex)
     std::string sybil_url;           // Hidden: embedding endpoint URL
     ea_t filter_address = BADADDR;   // Filter by specific address
@@ -158,6 +161,7 @@ struct Options {
     bool sybil_embeddings = false;   // Hidden: request embeddings instead of dumping
     bool start_index_set = false;    // User explicitly set --start-index/--offset
     bool resume = true;              // Resume file exports from a checkpoint when possible
+    bool folder_files = false;       // Export IDA function folders as files/directories
 };
 
 static Options g_opts;
@@ -281,6 +285,8 @@ public:
         std::cerr << " \033[90m│\033[0m \033[35m" << format_bytes(g_stats.output_bytes) << "\033[0m";
         if (!g_opts.output_file.empty()) {
             std::cerr << " \033[90m→\033[0m \033[33m" << g_opts.output_file << "\033[0m";
+        } else if (g_opts.folder_files) {
+            std::cerr << " \033[90m→\033[0m \033[33m" << g_opts.output_dir << "\033[0m";
         }
         std::cerr << "\n";
     }
@@ -292,7 +298,7 @@ private:
 
     bool should_show() const {
         // Show progress when outputting to file (progress goes to stderr)
-        return !g_opts.output_file.empty();
+        return !g_opts.output_file.empty() || g_opts.folder_files;
     }
 
     static std::string format_duration(double seconds) {
@@ -337,7 +343,7 @@ class OutputWriter {
 public:
     template<typename T>
     OutputWriter& operator<<(const T& val) {
-        if (!g_opts.output_file.empty()) {
+        if (!g_opts.output_file.empty() || g_opts.folder_files) {
             std::ostringstream oss;
             oss << val;
             std::string s = oss.str();
@@ -372,6 +378,35 @@ static bool open_output_file(std::ios::openmode mode = std::ios::trunc) {
     }
     g_output = g_output_file.get();
     return true;
+}
+
+static bool open_output_path(const std::filesystem::path &path,
+                             std::ios::openmode mode = std::ios::trunc) {
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+        std::cerr << "Error: Cannot create output directory "
+                  << path.parent_path().string() << ": " << ec.message() << "\n";
+        return false;
+    }
+
+    g_output_file = std::make_unique<std::ofstream>(
+        path, std::ios::out | std::ios::binary | mode);
+    if (!g_output_file->is_open()) {
+        std::cerr << "Error: Cannot open output file: " << path.string() << "\n";
+        return false;
+    }
+    g_output = g_output_file.get();
+    return true;
+}
+
+static void close_output_file() {
+    if (g_output_file) {
+        g_output_file->flush();
+        g_output_file->close();
+        g_output_file.reset();
+    }
+    g_output = &std::cout;
 }
 
 //=============================================================================
@@ -1306,6 +1341,8 @@ struct FunctionEntry {
     std::string name;
     ea_t start_ea = BADADDR;
     ea_t end_ea = BADADDR;
+    std::string tree_path;             // IDA function dirtree path, when available
+    std::filesystem::path output_path; // Directory export target, when available
 };
 
 struct FunctionRange {
@@ -1321,7 +1358,158 @@ struct ResumeState {
     bool valid = false;
     size_t next_index = 0;      // Next exporter-order index to process
     uintmax_t output_size = 0;  // Last complete output-file byte boundary
+    std::filesystem::path output_path; // File that owns output_size in directory mode
 };
+
+static std::vector<std::string> split_tree_path(const std::string &path) {
+    std::vector<std::string> parts;
+    std::string part;
+    for (char c : path) {
+        if (c == '/' || c == '\\') {
+            if (!part.empty()) {
+                parts.push_back(part);
+                part.clear();
+            }
+        } else {
+            part.push_back(c);
+        }
+    }
+    if (!part.empty()) parts.push_back(part);
+    return parts;
+}
+
+static std::string to_lower_copy(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return text;
+}
+
+static bool has_source_file_extension(const std::string &name) {
+    static const char *exts[] = {
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
+        ".asm", ".s", ".inc", ".mc", ".txt"
+    };
+    std::string lower = to_lower_copy(name);
+    for (const char *ext : exts) {
+        size_t ext_len = strlen(ext);
+        if (lower.size() >= ext_len &&
+            lower.compare(lower.size() - ext_len, ext_len, ext) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::string sanitize_path_component(const std::string &text,
+                                           const std::string &fallback) {
+    std::string out;
+    out.reserve(text.size());
+    for (unsigned char c : text) {
+        if (std::isalnum(c) || c == '.' || c == '_' || c == '-' || c == '+') {
+            out.push_back((char)c);
+        } else if (std::isspace(c)) {
+            out.push_back('_');
+        } else {
+            out.push_back('_');
+        }
+    }
+
+    while (!out.empty() && (out.front() == '.' || out.front() == ' ')) out.erase(out.begin());
+    while (!out.empty() && (out.back() == ' ')) out.pop_back();
+    if (out.empty()) out = fallback;
+    if (out == "." || out == "..") out = fallback;
+    return out;
+}
+
+static std::string default_export_extension() {
+    size_t selected = (g_opts.show_assembly ? 1 : 0) +
+                      (g_opts.show_microcode ? 1 : 0) +
+                      (g_opts.show_pseudocode ? 1 : 0);
+    if (selected == 1) {
+        if (g_opts.show_pseudocode) return ".c";
+        if (g_opts.show_microcode) return ".mc";
+        if (g_opts.show_assembly) return ".asm";
+    }
+    return ".txt";
+}
+
+static std::filesystem::path build_sanitized_relative_path(
+        const std::vector<std::string> &parts,
+        size_t begin,
+        size_t end) {
+    std::filesystem::path rel;
+    for (size_t i = begin; i < end; ++i) {
+        rel /= sanitize_path_component(parts[i], "folder");
+    }
+    return rel;
+}
+
+static std::filesystem::path unique_output_path(
+        const std::filesystem::path &desired,
+        std::unordered_map<std::string, std::filesystem::path> &key_to_path,
+        std::unordered_map<std::string, size_t> &path_counts,
+        const std::string &stable_key) {
+    auto found = key_to_path.find(stable_key);
+    if (found != key_to_path.end()) {
+        return found->second;
+    }
+
+    std::filesystem::path chosen = desired;
+    std::string normalized = chosen.lexically_normal().generic_string();
+    size_t count = path_counts[normalized]++;
+    if (count > 0) {
+        std::filesystem::path parent = desired.parent_path();
+        std::string stem = desired.stem().string();
+        std::string ext = desired.extension().string();
+        chosen = parent / (stem + "_" + std::to_string(count) + ext);
+        normalized = chosen.lexically_normal().generic_string();
+        while (path_counts.find(normalized) != path_counts.end()) {
+            ++count;
+            chosen = parent / (stem + "_" + std::to_string(count) + ext);
+            normalized = chosen.lexically_normal().generic_string();
+        }
+        path_counts[normalized] = 1;
+    }
+
+    key_to_path[stable_key] = chosen;
+    return chosen;
+}
+
+static std::filesystem::path fallback_function_output_path(
+        const FunctionEntry &entry,
+        const std::vector<std::string> &parts) {
+    std::filesystem::path rel = build_sanitized_relative_path(parts, 0, parts.size());
+    std::string fname = sanitize_path_component(entry.name, "function");
+    std::string addr = sanitize_path_component(format_address(entry.start_ea), "addr");
+    rel /= fname + "_" + addr + default_export_extension();
+    return std::filesystem::path(g_opts.output_dir) / rel;
+}
+
+static std::filesystem::path folder_file_output_path(
+        const FunctionEntry &entry,
+        const std::string &abs_path,
+        std::unordered_map<std::string, std::filesystem::path> &key_to_path,
+        std::unordered_map<std::string, size_t> &path_counts) {
+    std::vector<std::string> parts = split_tree_path(abs_path);
+    if (!parts.empty()) parts.pop_back(); // Drop the function item name.
+
+    for (size_t i = parts.size(); i > 0; --i) {
+        if (!has_source_file_extension(parts[i - 1])) continue;
+
+        std::filesystem::path rel = build_sanitized_relative_path(parts, 0, i - 1);
+        rel /= sanitize_path_component(parts[i - 1], "source.txt");
+        std::filesystem::path desired = std::filesystem::path(g_opts.output_dir) / rel;
+
+        std::string stable_key;
+        for (size_t j = 0; j < i; ++j) {
+            stable_key += "/";
+            stable_key += parts[j];
+        }
+        return unique_output_path(desired, key_to_path, path_counts, stable_key);
+    }
+
+    return fallback_function_output_path(entry, parts);
+}
 
 static std::vector<FunctionEntry> collect_export_plan() {
     std::vector<FunctionEntry> plan;
@@ -1347,6 +1535,79 @@ static std::vector<FunctionEntry> collect_export_plan() {
     }
 
     return plan;
+}
+
+static std::vector<FunctionEntry> collect_folder_file_export_plan() {
+    std::vector<FunctionEntry> plan;
+    dirtree_t *dt = get_std_dirtree(DIRTREE_FUNCS);
+    if (!dt || !dt->load()) {
+        return plan;
+    }
+
+    std::unordered_map<std::string, std::filesystem::path> key_to_path;
+    std::unordered_map<std::string, size_t> path_counts;
+
+    struct Visitor : public dirtree_visitor_t {
+        dirtree_t *dt = nullptr;
+        std::vector<FunctionEntry> *plan = nullptr;
+        std::unordered_map<std::string, std::filesystem::path> *key_to_path = nullptr;
+        std::unordered_map<std::string, size_t> *path_counts = nullptr;
+
+        ssize_t visit(const dirtree_cursor_t &cursor, const direntry_t &de) override {
+            if (!dirtree_t::isfile(de)) return 0;
+
+            ea_t ea = (ea_t)de.idx;
+            func_t *pfn = get_func(ea);
+            if (!pfn) return 0;
+
+            qstring fname;
+            get_func_name(&fname, pfn->start_ea);
+            if (!FunctionDumper::should_process(pfn, fname.c_str())) {
+                return 0;
+            }
+
+            qstring abs_path = dt->get_abspath(cursor, DTN_DISPLAY_NAME);
+
+            FunctionEntry entry;
+            entry.index = plan->size();
+            entry.pfn = pfn;
+            entry.name = fname.c_str();
+            entry.start_ea = pfn->start_ea;
+            entry.end_ea = pfn->end_ea;
+            entry.tree_path = abs_path.c_str();
+            entry.output_path = folder_file_output_path(
+                entry, entry.tree_path, *key_to_path, *path_counts);
+            plan->push_back(std::move(entry));
+            return 0;
+        }
+    };
+
+    Visitor visitor;
+    visitor.dt = dt;
+    visitor.plan = &plan;
+    visitor.key_to_path = &key_to_path;
+    visitor.path_counts = &path_counts;
+    dt->traverse(visitor);
+
+    return plan;
+}
+
+static std::vector<FunctionEntry> collect_active_export_plan() {
+    if (g_opts.folder_files) {
+        std::vector<FunctionEntry> plan = collect_folder_file_export_plan();
+        if (!plan.empty()) {
+            return plan;
+        }
+        std::cerr << "\033[33mWarning: Function folder tree is empty; "
+                  << "falling back to flat function order.\033[0m\n";
+        plan = collect_export_plan();
+        std::vector<std::string> no_parts;
+        for (auto &entry : plan) {
+            entry.output_path = fallback_function_output_path(entry, no_parts);
+        }
+        return plan;
+    }
+    return collect_export_plan();
 }
 
 static FunctionRange selected_function_range(size_t plan_size) {
@@ -1378,6 +1639,7 @@ static std::string export_plan_signature(const std::vector<FunctionEntry> &plan,
     uint64_t hash = 1469598103934665603ULL;
 
     hash_text(hash, g_opts.input_file);
+    hash_text(hash, g_opts.output_dir);
     hash_text(hash, g_opts.filter_pattern);
     for (const auto &item : g_opts.function_list) hash_text(hash, item);
     hash_text(hash, format_address(g_opts.filter_address));
@@ -1386,6 +1648,7 @@ static std::string export_plan_signature(const std::vector<FunctionEntry> &plan,
     hash_text(hash, g_opts.show_pseudocode ? "pseudo" : "no-pseudo");
     hash_text(hash, g_opts.format_pseudocode ? "format" : "no-format");
     hash_text(hash, g_opts.errors_only ? "errors-only" : "all");
+    hash_text(hash, g_opts.folder_files ? "folder-files" : "flat-file");
     hash_text(hash, std::to_string(g_opts.start_index));
     hash_text(hash, std::to_string(g_opts.max_functions));
     hash_text(hash, std::to_string(plan.size()));
@@ -1397,6 +1660,8 @@ static std::string export_plan_signature(const std::vector<FunctionEntry> &plan,
         hash_text(hash, entry.name);
         hash_text(hash, format_address(entry.start_ea));
         hash_text(hash, format_address(entry.end_ea));
+        hash_text(hash, entry.tree_path);
+        hash_text(hash, entry.output_path.generic_string());
     }
 
     std::ostringstream oss;
@@ -1406,6 +1671,10 @@ static std::string export_plan_signature(const std::vector<FunctionEntry> &plan,
 
 static std::filesystem::path checkpoint_path_for_output() {
     return std::filesystem::path(g_opts.output_file + ".progress");
+}
+
+static std::filesystem::path checkpoint_path_for_output_dir() {
+    return std::filesystem::path(g_opts.output_dir) / ".idalib-dump.progress";
 }
 
 static bool parse_size_value(const std::string &text, size_t &value) {
@@ -1454,6 +1723,8 @@ static ResumeState read_resume_state(const std::filesystem::path &path,
             have_next_index = parse_size_value(value, state.next_index);
         } else if (key == "output_size") {
             have_output_size = parse_uintmax_value(value, state.output_size);
+        } else if (key == "output_path") {
+            state.output_path = value;
         }
     }
 
@@ -1471,7 +1742,10 @@ static ResumeState read_resume_state(const std::filesystem::path &path,
     }
 
     std::error_code ec;
-    uintmax_t actual_size = std::filesystem::file_size(g_opts.output_file, ec);
+    std::filesystem::path size_path = state.output_path.empty()
+        ? std::filesystem::path(g_opts.output_file)
+        : state.output_path;
+    uintmax_t actual_size = std::filesystem::file_size(size_path, ec);
     if (ec || actual_size < state.output_size) {
         return ResumeState{};
     }
@@ -1484,7 +1758,8 @@ static void write_resume_state(const std::filesystem::path &path,
                                const std::string &signature,
                                size_t next_index,
                                uintmax_t output_size,
-                               const FunctionRange &range) {
+                               const FunctionRange &range,
+                               const std::filesystem::path &output_path = {}) {
     std::filesystem::path tmp_path = path;
     tmp_path += ".tmp";
 
@@ -1495,6 +1770,9 @@ static void write_resume_state(const std::filesystem::path &path,
         file << "signature=" << signature << "\n";
         file << "next_index=" << next_index << "\n";
         file << "output_size=" << output_size << "\n";
+        if (!output_path.empty()) {
+            file << "output_path=" << output_path.lexically_normal().string() << "\n";
+        }
         file << "range_begin=" << range.begin << "\n";
         file << "range_end=" << range.end << "\n";
     }
@@ -1513,6 +1791,117 @@ static uintmax_t current_output_size() {
     auto pos = g_output_file->tellp();
     if (pos == std::ostream::pos_type(-1)) return g_stats.output_bytes;
     return static_cast<uintmax_t>(pos);
+}
+
+static bool dump_folder_file_plan(const std::vector<FunctionEntry> &plan,
+                                  const FunctionRange &range) {
+    std::error_code ec;
+    std::filesystem::create_directories(g_opts.output_dir, ec);
+    if (ec) {
+        std::cerr << "Error: Cannot create output directory "
+                  << g_opts.output_dir << ": " << ec.message() << "\n";
+        return false;
+    }
+
+    size_t dump_begin = range.begin;
+    std::filesystem::path checkpoint_path = checkpoint_path_for_output_dir();
+    std::string checkpoint_signature = export_plan_signature(plan, range);
+    bool checkpoint_enabled = g_opts.resume;
+    bool resumed_from_checkpoint = false;
+    std::filesystem::path resume_path;
+
+    if (checkpoint_enabled) {
+        ResumeState state = read_resume_state(checkpoint_path, checkpoint_signature, range);
+        if (state.valid) {
+            resumed_from_checkpoint = true;
+            dump_begin = state.next_index;
+            resume_path = state.output_path;
+
+            if (dump_begin >= range.end) {
+                std::cerr << "\r\033[KFolder export already complete; removing checkpoint "
+                          << checkpoint_path.string() << "\n";
+                std::filesystem::remove(checkpoint_path, ec);
+                return true;
+            }
+
+            if (!resume_path.empty()) {
+                std::filesystem::resize_file(resume_path, state.output_size, ec);
+                if (ec) {
+                    std::cerr << "Error: Cannot truncate output file for resume: "
+                              << resume_path.string() << ": " << ec.message() << "\n";
+                    return false;
+                }
+            }
+
+            g_stats.processed = dump_begin - range.begin;
+            std::cerr << "\r\033[KResuming folder export at function index "
+                      << dump_begin << " (" << g_stats.processed << "/"
+                      << range.size() << " complete)\n";
+        }
+    } else {
+        std::filesystem::remove(checkpoint_path, ec);
+    }
+
+    bool append_from_explicit_offset = g_opts.start_index_set && range.begin > 0;
+    if (append_from_explicit_offset && !resumed_from_checkpoint) {
+        std::cerr << "\r\033[KAppending folder export from function index "
+                  << range.begin << "\n";
+    }
+
+    std::unordered_map<std::string, bool> opened_paths;
+    std::filesystem::path current_path;
+
+    for (size_t i = dump_begin; i < range.end; ++i) {
+        const FunctionEntry &entry = plan[i];
+        if (entry.output_path.empty()) {
+            std::cerr << "\nError: Missing output path for " << entry.name << "\n";
+            return false;
+        }
+
+        if (!g_output_file || current_path != entry.output_path) {
+            close_output_file();
+            current_path = entry.output_path;
+
+            std::string key = current_path.lexically_normal().generic_string();
+            bool first_open = opened_paths.find(key) == opened_paths.end();
+            std::ios::openmode mode = std::ios::app;
+
+            if (resumed_from_checkpoint && i == dump_begin && current_path == resume_path) {
+                mode = std::ios::app;
+            } else if (append_from_explicit_offset) {
+                mode = std::ios::app;
+            } else if (first_open) {
+                mode = std::ios::trunc;
+            }
+
+            if (!open_output_path(current_path, mode)) {
+                return false;
+            }
+            opened_paths[key] = true;
+        }
+
+        FunctionDumper::dump(entry.pfn);
+
+        g_output_file->flush();
+        if (!*g_output_file) {
+            std::cerr << "\nError: Failed to write output file: "
+                      << current_path.string() << "\n";
+            return false;
+        }
+
+        g_stats.processed = (i + 1) - range.begin;
+        uintmax_t file_size = current_output_size();
+        if (checkpoint_enabled) {
+            write_resume_state(checkpoint_path, checkpoint_signature,
+                               i + 1, file_size, range, current_path);
+        }
+        g_progress.update(g_stats.processed, entry.name);
+    }
+
+    close_output_file();
+    g_progress.finish();
+    std::filesystem::remove(checkpoint_path, ec);
+    return true;
 }
 
 //=============================================================================
@@ -2272,12 +2661,14 @@ static void print_usage(const char* prog) {
     std::cout << CLR(Cyan) << "Usage:" << CLR(Reset) << " " << prog << " [options] <binary_file>\n\n";
     std::cout << CLR(Cyan) << "Options:" << CLR(Reset) << "\n";
     std::cout << "  -o, --output <file>      Write output to file (shows progress on stderr)\n";
+    std::cout << "  -O, --output-dir <dir>   Export function folder tree into files under dir\n";
+    std::cout << "  --folder-files           Treat source-like function folders as aggregate files\n";
     std::cout << "  -f, --filter <pattern>   Filter functions by name (regex)\n";
     std::cout << "  -F, --functions <list>   List of functions (comma or pipe separated)\n";
     std::cout << "  -a, --address <addr>     Show only function at address (hex)\n";
     std::cout << "  -e, --errors             Show only functions with decompilation errors\n";
     std::cout << "  -l, --list               List exporter-order indexes (no decompilation)\n";
-    std::cout << "  --start-index <n>        Start at exporter-order index n; appends with -o\n";
+    std::cout << "  --start-index <n>        Start at exporter-order index n; appends with -o/-O\n";
     std::cout << "  --offset <n>             Alias for --start-index\n";
     std::cout << "  --count <n>              Process at most n functions from the start index\n";
     std::cout << "  --limit <n>              Alias for --count\n";
@@ -2307,6 +2698,7 @@ static void print_usage(const char* prog) {
     std::cout << "  " << prog << " -f main program.exe                # Only 'main' function\n";
     std::cout << "  " << prog << " -F main,foo,bar program.exe        # Specific functions by name\n";
     std::cout << "  " << prog << " -o out.c --pseudo-only program.exe # Export to file with progress\n";
+    std::cout << "  " << prog << " -O dump --folder-files --pseudo-only program.exe\n";
     std::cout << "  " << prog << " -l program.exe                     # List exporter-order indexes\n";
     std::cout << "  " << prog << " -o out.c --start-index 100 --count 50 program.exe\n";
     std::cout << "  " << prog << " -e program.exe                     # Only show errors\n";
@@ -2345,6 +2737,17 @@ static bool parse_args(int argc, char* argv[]) {
                 return false;
             }
             g_opts.output_file = argv[++i];
+        }
+        else if (arg == "-O" || arg == "--output-dir") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --output-dir requires a directory\n";
+                return false;
+            }
+            g_opts.output_dir = argv[++i];
+            g_opts.folder_files = true;
+        }
+        else if (arg == "--folder-files") {
+            g_opts.folder_files = true;
         }
         else if (arg == "-f" || arg == "--filter") {
             if (i + 1 >= argc) {
@@ -2492,6 +2895,18 @@ static bool parse_args(int argc, char* argv[]) {
         std::cerr << "Error: --sybil cannot be combined with --list\n";
         return false;
     }
+    if (g_opts.folder_files && g_opts.output_dir.empty()) {
+        std::cerr << "Error: --folder-files requires --output-dir <dir>\n";
+        return false;
+    }
+    if (g_opts.folder_files && !g_opts.output_file.empty()) {
+        std::cerr << "Error: --output cannot be combined with --output-dir/--folder-files\n";
+        return false;
+    }
+    if (g_opts.folder_files && g_opts.sybil_embeddings) {
+        std::cerr << "Error: --sybil cannot be combined with --folder-files\n";
+        return false;
+    }
 
     // If user explicitly selected any outputs, show only those selections.
     if (asm_selected || mc_selected || pseudo_selected) {
@@ -2522,6 +2937,11 @@ int main(int argc, char *argv[]) {
         g_opts.quiet = true;
         g_opts.no_plugins = true;
     }
+    if (g_opts.folder_files) {
+        Color::disable();
+        g_opts.quiet = true;
+        g_opts.no_plugins = true;
+    }
 
     if (g_opts.sybil_embeddings) {
         Color::disable();
@@ -2530,7 +2950,8 @@ int main(int argc, char *argv[]) {
     }
 
     // In file mode, suppress normal console output
-    bool show_console_info = g_opts.output_file.empty() && !g_opts.quiet && !g_opts.sybil_embeddings;
+    bool show_console_info = g_opts.output_file.empty() && !g_opts.folder_files &&
+                             !g_opts.quiet && !g_opts.sybil_embeddings;
     bool sybil_completed = false;
 
     HighlighterGuard highlighter_guard;
@@ -2548,7 +2969,7 @@ int main(int argc, char *argv[]) {
         }
 
         g_stats.total_functions = get_func_qty();
-        std::vector<FunctionEntry> export_plan = collect_export_plan();
+        std::vector<FunctionEntry> export_plan = collect_active_export_plan();
         FunctionRange function_range = selected_function_range(export_plan.size());
         g_stats.functions_to_process = function_range.size();
         g_progress.set_total(g_stats.functions_to_process);
@@ -2646,6 +3067,10 @@ int main(int argc, char *argv[]) {
                 FunctionDumper::list(export_plan[i].pfn, export_plan[i].index);
             }
             std::cout << "\n";
+        } else if (g_opts.folder_files) {
+            if (!dump_folder_file_plan(export_plan, function_range)) {
+                return EXIT_FAILURE;
+            }
         } else {
             size_t dump_begin = function_range.begin;
             std::filesystem::path checkpoint_path;

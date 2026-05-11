@@ -84,7 +84,7 @@ By default, assembly and pseudocode are shown. Use these flags to customize:
 | `-a, --address <hex>` | Show only the function at a specific address |
 | `-e, --errors` | Show only functions that fail to decompile |
 | `-l, --list` | List exporter-order function indexes without decompilation |
-| `--start-index <n>` | Start at exporter-order function index `n` (0-based); appends when used with `-o` and `n > 0` |
+| `--start-index <n>` | Start at exporter-order function index `n` (0-based); appends when used with `-o`/`-O` and `n > 0` |
 | `--offset <n>` | Alias for `--start-index` |
 | `--count <n>` | Process at most `n` functions from the start index |
 | `--limit <n>` | Alias for `--count` |
@@ -94,6 +94,8 @@ By default, assembly and pseudocode are shown. Use these flags to customize:
 | Flag | Description |
 |------|-------------|
 | `-o, --output <file>` | Write output to file (shows progress on stderr) |
+| `-O, --output-dir <dir>` | Export IDA function folders into files under a directory |
+| `--folder-files` | Treat source-like function folders as aggregate files |
 | `-q, --quiet` | Suppress IDA messages and binary info |
 | `-v, --verbose` | Show extra metadata (size, flags, segments) |
 | `--no-format-pseudo` | Disable AStyle formatting of pseudocode |
@@ -106,8 +108,14 @@ When dumping to a file with `-o`, `ida_dump` writes a checkpoint sidecar named
 the same command and it will validate the same exporter-order function plan,
 truncate the output back to the last complete function boundary, and continue
 from the next function. The checkpoint is removed after a completed export.
-Manual continuation with `--start-index`/`--offset` and `-o` appends to the
+Manual continuation with `--start-index`/`--offset` and `-o`/`-O` appends to
 existing output by default.
+
+With `--output-dir`/`--folder-files`, IDA's function folder tree is mirrored on
+disk. Source-like folder names such as `foo.cpp`, `bar.c`, or `init.asm` become
+aggregate files containing the functions below them in folder order. The
+directory export writes a checkpoint at `<output-dir>/.idalib-dump.progress`
+and resumes from the last complete function on rerun.
 
 ### Plugin Control
 
@@ -132,6 +140,9 @@ ida_dump -F "main,parse_config,init" program.exe
 
 # Export pseudocode to file with progress bar
 ida_dump -o output.c --pseudo-only program.exe
+
+# Export IDA function folders into aggregate source-like files
+ida_dump -O dump --folder-files --pseudo-only program.exe
 
 # Find all functions matching a pattern
 ida_dump -f 'parse_.*' program.exe
