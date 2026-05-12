@@ -187,6 +187,9 @@ Analyzes a binary and pushes all function metadata to the Hex-Rays Lumina server
 | `-r, --recursive` | Recursively process all files under `<input_path>` |
 | `-v, --verbose` | Show extra debug output |
 | `-j, --jobs <count>` | Worker processes for `--recursive` (defaults to CPU count) |
+| `--ext <ext>` | Only process files with this extension; repeatable, accepts `dll` or `.dll` |
+| `--type <type>` | Only process detected binary type; repeatable, supports `pe`, `elf`, `mach-o`, `unknown` |
+| `--require-debug` | Only process files with debug info; PE files also match when a same-basename `.pdb` is present |
 | `--no-color` | Disable colored output |
 | `--no-plugins` | Don't load user plugins (Hex-Rays still loads) |
 | `--plugin <pattern>` | Load plugins matching pattern (implies `--no-plugins`) |
@@ -205,6 +208,12 @@ ida_lumina -r samples/
 
 # Recursively process a directory with custom concurrency
 ida_lumina -r -j 4 samples/
+
+# Recursively process only PE DLLs and EXEs
+ida_lumina -r --ext dll --ext exe --type pe samples/
+
+# Process only files that have debug info or an adjacent PDB for PE files
+ida_lumina -r --type pe --require-debug samples/
 
 # With specific plugin enabled
 ida_lumina --plugin dazhbog program.exe

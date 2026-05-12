@@ -22,6 +22,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstdint>
+#include <fstream>
 #include <filesystem>
 #include <limits>
 
@@ -106,8 +107,11 @@ struct Options {
     bool no_plugins = false;
     bool recursive = false;
     bool verbose = false;
+    bool require_debug = false;
     unsigned int jobs = 0;
     bool jobs_specified = false;
+    std::vector<std::string> extensions;
+    std::vector<std::string> file_types;
     std::vector<std::string> plugin_patterns;  // Additional plugins to load in no-plugins mode
 };
 
@@ -590,6 +594,431 @@ static bool parse_positive_uint(const std::string& value, unsigned int& parsed) 
     }
 }
 
+static std::string to_lower_ascii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+static std::string normalize_extension(std::string value) {
+    value = to_lower_ascii(value);
+    while (!value.empty() && value.front() == '.') {
+        value.erase(value.begin());
+    }
+    return value;
+}
+
+static std::string path_extension_without_dot(const std::filesystem::path& path) {
+    return normalize_extension(path.extension().string());
+}
+
+static std::string normalize_file_type(std::string value) {
+    value = to_lower_ascii(value);
+    if (value == "mach" || value == "macho" || value == "mach_o") {
+        return "mach-o";
+    }
+    return value;
+}
+
+static bool valid_file_type_filter(const std::string& value) {
+    return value == "pe" || value == "elf" || value == "mach-o" || value == "unknown";
+}
+
+static bool read_file_range(const std::filesystem::path& path, uint64_t offset, size_t size, std::vector<uint8_t>& out) {
+    out.clear();
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+    file.seekg(0, std::ios::end);
+    const std::streamoff length = file.tellg();
+    if (length < 0 || offset >= static_cast<uint64_t>(length)) {
+        return false;
+    }
+
+    const uint64_t available = static_cast<uint64_t>(length) - offset;
+    const size_t to_read = static_cast<size_t>(std::min<uint64_t>(available, size));
+    out.resize(to_read);
+    file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    file.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size()));
+    return file.good() || static_cast<size_t>(file.gcount()) == out.size();
+}
+
+static uint16_t read_u16(const std::vector<uint8_t>& data, size_t off, bool little_endian = true) {
+    if (off + 2 > data.size()) {
+        return 0;
+    }
+    if (little_endian) {
+        return static_cast<uint16_t>(data[off] | (data[off + 1] << 8));
+    }
+    return static_cast<uint16_t>((data[off] << 8) | data[off + 1]);
+}
+
+static uint32_t read_u32(const std::vector<uint8_t>& data, size_t off, bool little_endian = true) {
+    if (off + 4 > data.size()) {
+        return 0;
+    }
+    if (little_endian) {
+        return static_cast<uint32_t>(data[off])
+            | (static_cast<uint32_t>(data[off + 1]) << 8)
+            | (static_cast<uint32_t>(data[off + 2]) << 16)
+            | (static_cast<uint32_t>(data[off + 3]) << 24);
+    }
+    return (static_cast<uint32_t>(data[off]) << 24)
+        | (static_cast<uint32_t>(data[off + 1]) << 16)
+        | (static_cast<uint32_t>(data[off + 2]) << 8)
+        | static_cast<uint32_t>(data[off + 3]);
+}
+
+static uint64_t read_u64(const std::vector<uint8_t>& data, size_t off, bool little_endian = true) {
+    if (off + 8 > data.size()) {
+        return 0;
+    }
+    if (little_endian) {
+        uint64_t value = 0;
+        for (size_t i = 0; i < 8; ++i) {
+            value |= static_cast<uint64_t>(data[off + i]) << (i * 8);
+        }
+        return value;
+    }
+
+    uint64_t value = 0;
+    for (size_t i = 0; i < 8; ++i) {
+        value = (value << 8) | data[off + i];
+    }
+    return value;
+}
+
+static bool starts_with_string(const std::string& value, const char* prefix) {
+    const size_t prefix_len = std::strlen(prefix);
+    return value.size() >= prefix_len && value.compare(0, prefix_len, prefix) == 0;
+}
+
+static size_t bounded_cstring_length(const char* value, size_t max_len) {
+    size_t len = 0;
+    while (len < max_len && value[len] != '\0') {
+        ++len;
+    }
+    return len;
+}
+
+static bool same_basename_pdb_exists(const std::filesystem::path& input_path) {
+    std::error_code ec;
+    std::filesystem::path direct = input_path;
+    direct.replace_extension(".pdb");
+    if (std::filesystem::is_regular_file(direct, ec) && !ec) {
+        return true;
+    }
+
+    ec.clear();
+    const std::filesystem::path parent = input_path.parent_path().empty()
+        ? std::filesystem::path(".")
+        : input_path.parent_path();
+    if (!std::filesystem::is_directory(parent, ec) || ec) {
+        return false;
+    }
+
+    const std::string target = to_lower_ascii(input_path.stem().string() + ".pdb");
+    for (const auto& entry : std::filesystem::directory_iterator(parent, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_regular_file(ec) || ec) {
+            ec.clear();
+            continue;
+        }
+        if (to_lower_ascii(entry.path().filename().string()) == target) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct FileInspection {
+    std::string type = "unknown";
+    bool has_debug = false;
+};
+
+static bool has_pe_signature(const std::filesystem::path& path, const std::vector<uint8_t>& prefix) {
+    if (prefix.size() < 0x40) {
+        return false;
+    }
+
+    const uint32_t pe_offset = read_u32(prefix, 0x3c);
+    std::vector<uint8_t> headers;
+    if (!read_file_range(path, pe_offset, 24, headers) || headers.size() < 24) {
+        return false;
+    }
+    return headers[0] == 'P' && headers[1] == 'E' && headers[2] == 0 && headers[3] == 0;
+}
+
+static bool detect_pe_debug_info(const std::filesystem::path& path, const std::vector<uint8_t>& prefix) {
+    if (!has_pe_signature(path, prefix)) {
+        return false;
+    }
+    if (same_basename_pdb_exists(path)) {
+        return true;
+    }
+
+    const uint32_t pe_offset = read_u32(prefix, 0x3c);
+    std::vector<uint8_t> headers;
+    if (!read_file_range(path, pe_offset, 24, headers) || headers.size() < 24) {
+        return false;
+    }
+
+    const uint16_t section_count = read_u16(headers, 6);
+    const uint16_t optional_header_size = read_u16(headers, 20);
+    const size_t full_header_size = 24 + static_cast<size_t>(optional_header_size) + static_cast<size_t>(section_count) * 40;
+    if (!read_file_range(path, pe_offset, full_header_size, headers) || headers.size() < full_header_size) {
+        return false;
+    }
+
+    const size_t optional_offset = 24;
+    const uint16_t optional_magic = read_u16(headers, optional_offset);
+    size_t data_directory_offset = 0;
+    if (optional_magic == 0x10b) {
+        data_directory_offset = optional_offset + 96;
+    }
+    else if (optional_magic == 0x20b) {
+        data_directory_offset = optional_offset + 112;
+    }
+    else {
+        return false;
+    }
+
+    const size_t debug_directory = data_directory_offset + 6 * 8;
+    if (debug_directory + 8 > headers.size()) {
+        return false;
+    }
+    const uint32_t debug_rva = read_u32(headers, debug_directory);
+    const uint32_t debug_size = read_u32(headers, debug_directory + 4);
+    if (debug_rva == 0 || debug_size == 0) {
+        return false;
+    }
+
+    const size_t section_table = optional_offset + optional_header_size;
+    uint64_t debug_file_offset = 0;
+    for (uint16_t i = 0; i < section_count; ++i) {
+        const size_t section = section_table + static_cast<size_t>(i) * 40;
+        const uint32_t virtual_size = read_u32(headers, section + 8);
+        const uint32_t virtual_address = read_u32(headers, section + 12);
+        const uint32_t raw_size = read_u32(headers, section + 16);
+        const uint32_t raw_pointer = read_u32(headers, section + 20);
+        const uint32_t mapped_size = std::max(virtual_size, raw_size);
+        if (debug_rva >= virtual_address && debug_rva < virtual_address + mapped_size) {
+            debug_file_offset = static_cast<uint64_t>(raw_pointer) + (debug_rva - virtual_address);
+            break;
+        }
+    }
+
+    if (debug_file_offset == 0) {
+        return true;
+    }
+
+    std::vector<uint8_t> debug_data;
+    const size_t debug_read_size = static_cast<size_t>(std::min<uint32_t>(debug_size, 64 * 1024));
+    if (!read_file_range(path, debug_file_offset, debug_read_size, debug_data) || debug_data.size() < 28) {
+        return true;
+    }
+
+    for (size_t off = 0; off + 28 <= debug_data.size(); off += 28) {
+        const uint32_t type = read_u32(debug_data, off + 12);
+        const uint32_t size_of_data = read_u32(debug_data, off + 16);
+        const uint32_t pointer_to_raw_data = read_u32(debug_data, off + 24);
+        if (type == 2 && size_of_data >= 4 && pointer_to_raw_data != 0) {
+            std::vector<uint8_t> codeview;
+            if (read_file_range(path, pointer_to_raw_data, std::min<uint32_t>(size_of_data, 4096), codeview)
+                && codeview.size() >= 4
+                && ((codeview[0] == 'R' && codeview[1] == 'S' && codeview[2] == 'D' && codeview[3] == 'S')
+                    || (codeview[0] == 'N' && codeview[1] == 'B' && codeview[2] == '1' && codeview[3] == '0'))) {
+                return true;
+            }
+        }
+    }
+
+    return true;
+}
+
+static bool detect_elf_debug_info(const std::filesystem::path& path, const std::vector<uint8_t>& prefix) {
+    if (prefix.size() < 64 || prefix[0] != 0x7f || prefix[1] != 'E' || prefix[2] != 'L' || prefix[3] != 'F') {
+        return false;
+    }
+
+    const uint8_t elf_class = prefix[4];
+    const uint8_t elf_data = prefix[5];
+    const bool little_endian = elf_data != 2;
+
+    uint64_t section_header_offset = 0;
+    uint16_t section_header_size = 0;
+    uint16_t section_count = 0;
+    uint16_t string_table_index = 0;
+
+    if (elf_class == 1) {
+        section_header_offset = read_u32(prefix, 32, little_endian);
+        section_header_size = read_u16(prefix, 46, little_endian);
+        section_count = read_u16(prefix, 48, little_endian);
+        string_table_index = read_u16(prefix, 50, little_endian);
+    }
+    else if (elf_class == 2) {
+        section_header_offset = read_u64(prefix, 40, little_endian);
+        section_header_size = read_u16(prefix, 58, little_endian);
+        section_count = read_u16(prefix, 60, little_endian);
+        string_table_index = read_u16(prefix, 62, little_endian);
+    }
+    else {
+        return false;
+    }
+
+    if (section_header_offset == 0 || section_header_size == 0 || section_count == 0 || string_table_index >= section_count) {
+        return false;
+    }
+
+    const uint64_t table_size64 = static_cast<uint64_t>(section_header_size) * section_count;
+    if (table_size64 > 16 * 1024 * 1024) {
+        return false;
+    }
+
+    std::vector<uint8_t> section_headers;
+    if (!read_file_range(path, section_header_offset, static_cast<size_t>(table_size64), section_headers)
+        || section_headers.size() < table_size64) {
+        return false;
+    }
+
+    const size_t str_section = static_cast<size_t>(string_table_index) * section_header_size;
+    uint64_t str_offset = 0;
+    uint64_t str_size = 0;
+    if (elf_class == 1) {
+        str_offset = read_u32(section_headers, str_section + 16, little_endian);
+        str_size = read_u32(section_headers, str_section + 20, little_endian);
+    }
+    else {
+        str_offset = read_u64(section_headers, str_section + 24, little_endian);
+        str_size = read_u64(section_headers, str_section + 32, little_endian);
+    }
+
+    if (str_size == 0 || str_size > 16 * 1024 * 1024) {
+        return false;
+    }
+
+    std::vector<uint8_t> strings;
+    if (!read_file_range(path, str_offset, static_cast<size_t>(str_size), strings)) {
+        return false;
+    }
+
+    for (uint16_t i = 0; i < section_count; ++i) {
+        const size_t section = static_cast<size_t>(i) * section_header_size;
+        const uint32_t name_offset = read_u32(section_headers, section, little_endian);
+        if (name_offset >= strings.size()) {
+            continue;
+        }
+
+        const char* name_ptr = reinterpret_cast<const char*>(strings.data() + name_offset);
+        const size_t remaining = strings.size() - name_offset;
+        const size_t name_len = bounded_cstring_length(name_ptr, remaining);
+        std::string name(name_ptr, name_len);
+        if (starts_with_string(name, ".debug_")
+            || starts_with_string(name, ".zdebug_")
+            || name == ".gnu_debuglink"
+            || name == ".stab"
+            || name == ".stabstr") {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool has_adjacent_dsym(const std::filesystem::path& input_path) {
+    std::error_code ec;
+    return std::filesystem::is_directory(input_path.string() + ".dSYM", ec) && !ec;
+}
+
+static bool detect_macho_debug_info(const std::filesystem::path& path) {
+    if (has_adjacent_dsym(path)) {
+        return true;
+    }
+
+    std::vector<uint8_t> data;
+    if (!read_file_range(path, 0, 1024 * 1024, data)) {
+        return false;
+    }
+
+    const char dwarf_segment[] = "__DWARF";
+    const char debug_prefix[] = "__debug_";
+    return std::search(data.begin(), data.end(), std::begin(dwarf_segment), std::end(dwarf_segment) - 1) != data.end()
+        || std::search(data.begin(), data.end(), std::begin(debug_prefix), std::end(debug_prefix) - 1) != data.end();
+}
+
+static FileInspection inspect_file(const std::string& input_file) {
+    const std::filesystem::path path(input_file);
+    std::vector<uint8_t> prefix;
+    FileInspection inspection;
+    if (!read_file_range(path, 0, 4096, prefix) || prefix.size() < 4) {
+        return inspection;
+    }
+
+    if (prefix[0] == 'M' && prefix[1] == 'Z' && has_pe_signature(path, prefix)) {
+        inspection.type = "pe";
+        inspection.has_debug = detect_pe_debug_info(path, prefix);
+    }
+    else if (prefix[0] == 0x7f && prefix[1] == 'E' && prefix[2] == 'L' && prefix[3] == 'F') {
+        inspection.type = "elf";
+        inspection.has_debug = detect_elf_debug_info(path, prefix);
+    }
+    else {
+        const uint32_t magic = read_u32(prefix, 0, true);
+        const uint32_t magic_be = read_u32(prefix, 0, false);
+        if (magic == 0xfeedface || magic == 0xfeedfacf || magic == 0xcefaedfe || magic == 0xcffaedfe
+            || magic_be == 0xcafebabe || magic_be == 0xcafebabf) {
+            inspection.type = "mach-o";
+            inspection.has_debug = detect_macho_debug_info(path);
+        }
+    }
+
+    return inspection;
+}
+
+static bool vector_contains(const std::vector<std::string>& values, const std::string& value) {
+    return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+static bool has_active_input_filters() {
+    return !g_opts.extensions.empty() || !g_opts.file_types.empty() || g_opts.require_debug;
+}
+
+static bool file_matches_filters(const std::string& input_file, std::string* reason = nullptr) {
+    const std::filesystem::path path(input_file);
+
+    if (!g_opts.extensions.empty()) {
+        const std::string extension = path_extension_without_dot(path);
+        if (!vector_contains(g_opts.extensions, extension)) {
+            if (reason) {
+                *reason = "extension ." + extension + " is not enabled";
+            }
+            return false;
+        }
+    }
+
+    if (!g_opts.file_types.empty() || g_opts.require_debug) {
+        const FileInspection inspection = inspect_file(input_file);
+        if (!g_opts.file_types.empty() && !vector_contains(g_opts.file_types, inspection.type)) {
+            if (reason) {
+                *reason = "detected type " + inspection.type + " is not enabled";
+            }
+            return false;
+        }
+        if (g_opts.require_debug && !inspection.has_debug) {
+            if (reason) {
+                *reason = "debug info was not detected";
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static void print_run_results(const FileRunResult& result) {
     std::cout << "\n";
     std::cout << CLR(Bold) << "Results" << CLR(Reset) << "\n";
@@ -725,7 +1154,12 @@ static std::string wait_status_message(int status) {
     return "worker terminated unexpectedly";
 }
 
-static std::vector<std::string> collect_recursive_inputs(const std::string& root_dir) {
+struct InputFilterStats {
+    size_t regular_files = 0;
+    size_t skipped_by_filter = 0;
+};
+
+static std::vector<std::string> collect_recursive_inputs(const std::string& root_dir, InputFilterStats* stats = nullptr) {
     std::filesystem::path root_path(root_dir);
     std::error_code ec;
 
@@ -752,7 +1186,15 @@ static std::vector<std::string> collect_recursive_inputs(const std::string& root
 
         std::error_code status_ec;
         if (it->is_regular_file(status_ec) && !status_ec) {
-            files.push_back(it->path().string());
+            if (stats) {
+                stats->regular_files++;
+            }
+            if (file_matches_filters(it->path().string())) {
+                files.push_back(it->path().string());
+            }
+            else if (stats) {
+                stats->skipped_by_filter++;
+            }
         }
     }
 
@@ -761,17 +1203,21 @@ static std::vector<std::string> collect_recursive_inputs(const std::string& root
 }
 
 static int run_recursive_mode() {
-    const std::vector<std::string> files = collect_recursive_inputs(g_opts.input_file);
+    InputFilterStats filter_stats;
+    const std::vector<std::string> files = collect_recursive_inputs(g_opts.input_file, &filter_stats);
     if (files.empty()) {
-        std::cerr << CLR(Yellow) << "[!] No regular files found under " << g_opts.input_file << CLR(Reset) << "\n";
+        std::cerr << CLR(Yellow) << "[!] No matching regular files found under " << g_opts.input_file << CLR(Reset) << "\n";
         return EXIT_FAILURE;
     }
 
     const unsigned int requested_jobs = g_opts.jobs_specified ? g_opts.jobs : default_job_count();
     const size_t max_jobs = std::max<size_t>(1, std::min<size_t>(requested_jobs, files.size()));
 
-    std::cout << "[*] Found " << files.size() << " files under " << g_opts.input_file
-              << "; running up to " << max_jobs << " worker processes." << std::endl;
+    std::cout << "[*] Found " << files.size() << " matching files under " << g_opts.input_file;
+    if (has_active_input_filters()) {
+        std::cout << " (" << filter_stats.skipped_by_filter << " skipped by filters)";
+    }
+    std::cout << "; running up to " << max_jobs << " worker processes." << std::endl;
 
     BatchRunStats batch;
     batch.files_total = files.size();
@@ -941,6 +1387,9 @@ static void print_usage(const char* prog) {
     std::cout << "  -r, --recursive      Recursively process all files under <input_path>\n";
     std::cout << "  -v, --verbose        Show extra debug output\n";
     std::cout << "  -j, --jobs <count>   Worker processes for --recursive (default: CPU count)\n";
+    std::cout << "  --ext <ext>          Only process files with extension (repeatable, e.g. dll)\n";
+    std::cout << "  --type <type>        Only process binary type: pe, elf, mach-o, unknown (repeatable)\n";
+    std::cout << "  --require-debug      Only process files with debug info; PE also accepts an adjacent PDB\n";
     std::cout << "  --no-color           Disable colored output\n";
     std::cout << "  --no-plugins         Don't load user plugins (except Hex-Rays)\n";
     std::cout << "  --plugin <pattern>   Load plugins matching pattern (implies --no-plugins)\n";
@@ -952,6 +1401,8 @@ static void print_usage(const char* prog) {
     std::cout << "  " << prog << " -q program.exe      # Quiet mode\n";
     std::cout << "  " << prog << " -r samples/         # Recursively push a folder\n";
     std::cout << "  " << prog << " -r -j 4 samples/    # Limit recursive mode to 4 workers\n";
+    std::cout << "  " << prog << " -r --ext dll --ext exe --type pe samples/\n";
+    std::cout << "  " << prog << " -r --type pe --require-debug samples/\n";
     std::cout << "\n";
     std::cout << CLR(Cyan) << "Note:" << CLR(Reset) << "\n";
     std::cout << "  Lumina credentials must be configured in IDA Pro settings.\n";
@@ -993,6 +1444,37 @@ static bool parse_args(int argc, char* argv[]) {
 
             g_opts.jobs = jobs;
             g_opts.jobs_specified = true;
+        }
+        else if (arg == "--ext" || arg == "--extension") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << arg << " requires an extension argument\n";
+                return false;
+            }
+            std::string extension = normalize_extension(argv[++i]);
+            if (extension.empty()) {
+                std::cerr << "Error: " << arg << " expects a non-empty extension\n";
+                return false;
+            }
+            if (!vector_contains(g_opts.extensions, extension)) {
+                g_opts.extensions.push_back(extension);
+            }
+        }
+        else if (arg == "--type") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --type requires a type argument\n";
+                return false;
+            }
+            std::string file_type = normalize_file_type(argv[++i]);
+            if (!valid_file_type_filter(file_type)) {
+                std::cerr << "Error: --type expects one of: pe, elf, mach-o, unknown\n";
+                return false;
+            }
+            if (!vector_contains(g_opts.file_types, file_type)) {
+                g_opts.file_types.push_back(file_type);
+            }
+        }
+        else if (arg == "--require-debug" || arg == "--with-debug" || arg == "--debug-info") {
+            g_opts.require_debug = true;
         }
         else if (arg == "--no-color") {
             Color::disable();
@@ -1049,6 +1531,17 @@ int main(int argc, char *argv[]) {
     if (!g_opts.recursive && std::filesystem::is_directory(g_opts.input_file, input_ec) && !input_ec) {
         std::cerr << "Error: " << g_opts.input_file << " is a directory; use --recursive to process folders\n";
         return EXIT_FAILURE;
+    }
+    if (!g_opts.recursive && has_active_input_filters()) {
+        std::string reason;
+        if (!file_matches_filters(g_opts.input_file, &reason)) {
+            std::cerr << "Error: " << g_opts.input_file << " does not match input filters";
+            if (!reason.empty()) {
+                std::cerr << ": " << reason;
+            }
+            std::cerr << "\n";
+            return EXIT_FAILURE;
+        }
     }
 
     try {
