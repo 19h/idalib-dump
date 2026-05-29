@@ -143,6 +143,7 @@ struct Options {
     std::string output_dir;          // Folder/file tree export root
     std::string filter_pattern;      // Function name filter (regex)
     std::string sybil_url;           // Hidden: embedding endpoint URL
+    std::string sybil_dump_file;     // Hidden: JSONL path for would-be-sent payloads
     ea_t filter_address = BADADDR;   // Filter by specific address
     std::vector<std::string> function_list;  // Explicit list of functions (names or addresses)
     std::vector<std::string> plugin_patterns;  // Additional plugins to load in no-plugins mode
@@ -159,6 +160,7 @@ struct Options {
     bool verbose = false;            // Show extra metadata
     bool no_plugins = false;         // Disable loading user plugins
     bool sybil_embeddings = false;   // Hidden: request embeddings instead of dumping
+    bool sybil_dump = false;         // Hidden: write would-be-sent payloads to JSONL
     bool start_index_set = false;    // User explicitly set --start-index/--offset
     bool resume = true;              // Resume file exports from a checkpoint when possible
     bool folder_files = false;       // Export IDA function folders as files/directories
@@ -287,6 +289,8 @@ public:
             std::cerr << " \033[90m→\033[0m \033[33m" << g_opts.output_file << "\033[0m";
         } else if (g_opts.folder_files) {
             std::cerr << " \033[90m→\033[0m \033[33m" << g_opts.output_dir << "\033[0m";
+        } else if (g_opts.sybil_dump) {
+            std::cerr << " \033[90m→\033[0m \033[33m" << g_opts.sybil_dump_file << "\033[0m";
         }
         std::cerr << "\n";
     }
@@ -298,7 +302,7 @@ private:
 
     bool should_show() const {
         // Show progress when outputting to file (progress goes to stderr)
-        return !g_opts.output_file.empty() || g_opts.folder_files;
+        return !g_opts.output_file.empty() || g_opts.folder_files || g_opts.sybil_dump;
     }
 
     static std::string format_duration(double seconds) {
@@ -2063,6 +2067,30 @@ static std::string shell_quote(const std::string &text) {
 #endif
 }
 
+// Build the JSON object for a single input, exactly as it appears inside the
+// "inputs" array sent to Sybil (empty fields are omitted to match the server's
+// expectations).
+static std::string build_sybil_input_object(const SybilFunctionInput &item) {
+    std::ostringstream json;
+    json << "{";
+    bool wrote_field = false;
+    if (!item.pseudo.empty()) {
+        json << "\"pseudo\":\"" << json_escape(item.pseudo) << "\"";
+        wrote_field = true;
+    }
+    if (!item.mc.empty()) {
+        if (wrote_field) json << ",";
+        json << "\"mc\":\"" << json_escape(item.mc) << "\"";
+        wrote_field = true;
+    }
+    if (!item.asm_text.empty()) {
+        if (wrote_field) json << ",";
+        json << "\"asm\":\"" << json_escape(item.asm_text) << "\"";
+    }
+    json << "}";
+    return json.str();
+}
+
 static std::string build_sybil_request_json(const std::vector<SybilFunctionInput> &items,
                                             size_t begin,
                                             size_t end) {
@@ -2070,25 +2098,37 @@ static std::string build_sybil_request_json(const std::vector<SybilFunctionInput
     json << "{\"inputs\":[";
     for (size_t i = begin; i < end; ++i) {
         if (i > begin) json << ",";
-        json << "{";
-        bool wrote_field = false;
-        if (!items[i].pseudo.empty()) {
-            json << "\"pseudo\":\"" << json_escape(items[i].pseudo) << "\"";
-            wrote_field = true;
-        }
-        if (!items[i].mc.empty()) {
-            if (wrote_field) json << ",";
-            json << "\"mc\":\"" << json_escape(items[i].mc) << "\"";
-            wrote_field = true;
-        }
-        if (!items[i].asm_text.empty()) {
-            if (wrote_field) json << ",";
-            json << "\"asm\":\"" << json_escape(items[i].asm_text) << "\"";
-        }
-        json << "}";
+        json << build_sybil_input_object(items[i]);
     }
     json << "]}";
     return json.str();
+}
+
+// Write the payloads that would otherwise be sent to Sybil to a JSONL file, one
+// function per line. Each line carries the function name and address for later
+// correlation alongside the exact request payload under "input".
+static bool write_sybil_jsonl(const std::vector<SybilFunctionInput> &items) {
+    std::ofstream out_file(g_opts.sybil_dump_file,
+                           std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!out_file.is_open()) {
+        std::cerr << "Error: Cannot open Sybil dump file: " << g_opts.sybil_dump_file << "\n";
+        return false;
+    }
+
+    for (const auto &item : items) {
+        std::string line = "{\"name\":\"" + json_escape(item.name) + "\","
+                           + "\"address\":\"" + json_escape(item.address) + "\","
+                           + "\"input\":" + build_sybil_input_object(item) + "}\n";
+        out_file << line;
+        g_stats.output_bytes += line.size();
+    }
+
+    out_file.flush();
+    if (!out_file) {
+        std::cerr << "Error: Failed to write Sybil dump file: " << g_opts.sybil_dump_file << "\n";
+        return false;
+    }
+    return true;
 }
 
 static bool run_curl_post_json(const std::string &url,
@@ -2822,6 +2862,14 @@ static bool parse_args(int argc, char* argv[]) {
             g_opts.sybil_url = argv[++i];
             g_opts.sybil_embeddings = true;
         }
+        else if (arg == "--sybil-dump" || arg == "--sybil-jsonl") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << arg << " requires an output file path\n";
+                return false;
+            }
+            g_opts.sybil_dump_file = argv[++i];
+            g_opts.sybil_dump = true;
+        }
         else if (arg == "-e" || arg == "--errors") {
             g_opts.errors_only = true;
         }
@@ -2935,8 +2983,12 @@ static bool parse_args(int argc, char* argv[]) {
         return false;
     }
 
-    if (g_opts.sybil_embeddings && g_opts.list_functions) {
-        std::cerr << "Error: --sybil cannot be combined with --list\n";
+    if (g_opts.sybil_embeddings && g_opts.sybil_dump) {
+        std::cerr << "Error: --sybil cannot be combined with --sybil-dump\n";
+        return false;
+    }
+    if ((g_opts.sybil_embeddings || g_opts.sybil_dump) && g_opts.list_functions) {
+        std::cerr << "Error: --sybil/--sybil-dump cannot be combined with --list\n";
         return false;
     }
     if (g_opts.folder_files && g_opts.output_dir.empty()) {
@@ -2947,8 +2999,8 @@ static bool parse_args(int argc, char* argv[]) {
         std::cerr << "Error: --output cannot be combined with --output-dir/--folder-files\n";
         return false;
     }
-    if (g_opts.folder_files && g_opts.sybil_embeddings) {
-        std::cerr << "Error: --sybil cannot be combined with --folder-files\n";
+    if (g_opts.folder_files && (g_opts.sybil_embeddings || g_opts.sybil_dump)) {
+        std::cerr << "Error: --sybil/--sybil-dump cannot be combined with --folder-files\n";
         return false;
     }
 
@@ -2984,14 +3036,14 @@ int main(int argc, char *argv[]) {
         g_opts.quiet = true;
     }
 
-    if (g_opts.sybil_embeddings) {
+    if (g_opts.sybil_embeddings || g_opts.sybil_dump) {
         Color::disable();
         g_opts.quiet = true;
     }
 
     // In file mode, suppress normal console output
     bool show_console_info = g_opts.output_file.empty() && !g_opts.folder_files &&
-                             !g_opts.quiet && !g_opts.sybil_embeddings;
+                             !g_opts.quiet && !g_opts.sybil_embeddings && !g_opts.sybil_dump;
     bool sybil_completed = false;
 
     HighlighterGuard highlighter_guard;
@@ -3036,7 +3088,11 @@ int main(int argc, char *argv[]) {
                       << " of " << export_plan.size() << " matching functions...\n";
         }
 
-        if (g_opts.sybil_embeddings) {
+        if (g_opts.sybil_embeddings || g_opts.sybil_dump) {
+            // Progress is shown on stderr whenever output isn't streamed to
+            // stdout (i.e. a file is being written, including the JSONL dump).
+            const bool report_progress = !g_opts.output_file.empty() || g_opts.sybil_dump;
+
             std::vector<SybilFunctionInput> sybil_inputs;
             sybil_inputs.reserve(function_range.size());
 
@@ -3049,39 +3105,49 @@ int main(int argc, char *argv[]) {
                     sybil_inputs.push_back(std::move(item));
                 }
 
-                if (!g_opts.output_file.empty()) {
+                if (report_progress) {
                     g_stats.processed = (i + 1) - function_range.begin;
                     g_progress.update(g_stats.processed, entry.name);
                 }
             }
 
             if (sybil_inputs.empty()) {
-                std::cerr << "Error: No functions available for Sybil embedding request\n";
+                std::cerr << "Error: No functions available for Sybil "
+                          << (g_opts.sybil_dump ? "payload dump" : "embedding request") << "\n";
                 return EXIT_FAILURE;
             }
 
-            if (!g_opts.output_file.empty()) {
+            if (g_opts.sybil_dump) {
                 std::cerr << "\r\033[KCollected " << sybil_inputs.size()
-                          << " functions; requesting Sybil embeddings...\n";
-            }
-
-            std::vector<std::string> embeddings;
-            if (!request_sybil_embeddings(sybil_inputs, embeddings)) {
-                return EXIT_FAILURE;
-            }
-
-            if (!g_opts.output_file.empty()) {
-                if (!open_output_file()) {
-                    return EXIT_FAILURE;
-                }
-                write_sybil_export(sybil_inputs, embeddings);
-                g_output_file->flush();
-                if (!*g_output_file) {
-                    std::cerr << "Error: Failed to write output file: "
-                              << g_opts.output_file << "\n";
+                          << " functions; writing payloads to " << g_opts.sybil_dump_file << "...\n";
+                if (!write_sybil_jsonl(sybil_inputs)) {
                     return EXIT_FAILURE;
                 }
                 g_progress.finish();
+            } else {
+                if (!g_opts.output_file.empty()) {
+                    std::cerr << "\r\033[KCollected " << sybil_inputs.size()
+                              << " functions; requesting Sybil embeddings...\n";
+                }
+
+                std::vector<std::string> embeddings;
+                if (!request_sybil_embeddings(sybil_inputs, embeddings)) {
+                    return EXIT_FAILURE;
+                }
+
+                if (!g_opts.output_file.empty()) {
+                    if (!open_output_file()) {
+                        return EXIT_FAILURE;
+                    }
+                    write_sybil_export(sybil_inputs, embeddings);
+                    g_output_file->flush();
+                    if (!*g_output_file) {
+                        std::cerr << "Error: Failed to write output file: "
+                                  << g_opts.output_file << "\n";
+                        return EXIT_FAILURE;
+                    }
+                    g_progress.finish();
+                }
             }
             sybil_completed = true;
             std::cout.flush();
@@ -3227,7 +3293,7 @@ int main(int argc, char *argv[]) {
         g_output_file->close();
     }
 
-    if (g_opts.sybil_embeddings && sybil_completed) {
+    if ((g_opts.sybil_embeddings || g_opts.sybil_dump) && sybil_completed) {
         std::cout.flush();
         std::cerr.flush();
         real_fflush(real_stdout);
