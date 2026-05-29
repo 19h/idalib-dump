@@ -31,6 +31,8 @@
 #include <chrono>
 #include <iomanip>
 #include <thread>
+#include <atomic>
+#include <csignal>
 #include <limits>
 #include <unordered_map>
 
@@ -72,6 +74,7 @@ static inline int posix_dup(int fd) { return _dup(fd); }
 static inline int posix_dup2(int fd1, int fd2) { return _dup2(fd1, fd2); }
 static inline int posix_close(int fd) { return _close(fd); }
 static inline int posix_open(const char* path, int flags) { return _open(path, flags); }
+static inline void posix_write(int fd, const void* buf, size_t count) { _write(fd, buf, (unsigned int)count); }
 static inline FILE* real_popen(const char* command, const char* mode) { return _popen(command, mode); }
 static inline int real_pclose(FILE* stream) { return _pclose(stream); }
 static inline int current_process_id() { return _getpid(); }
@@ -96,6 +99,7 @@ static inline int posix_dup(int fd) { return dup(fd); }
 static inline int posix_dup2(int fd1, int fd2) { return dup2(fd1, fd2); }
 static inline int posix_close(int fd) { return close(fd); }
 static inline int posix_open(const char* path, int flags) { return open(path, flags); }
+static inline void posix_write(int fd, const void* buf, size_t count) { ssize_t r = write(fd, buf, count); (void)r; }
 static inline FILE* real_popen(const char* command, const char* mode) { return popen(command, mode); }
 static inline int real_pclose(FILE* stream) { return pclose(stream); }
 static inline int current_process_id() { return getpid(); }
@@ -153,6 +157,7 @@ struct Options {
     bool show_microcode = false;
     bool show_pseudocode = true;
     bool format_pseudocode = true;
+    bool format_pseudo_explicit = false;  // User explicitly chose (no-)format-pseudo
     bool errors_only = false;        // Only show functions with errors
     bool quiet = false;              // Suppress IDA messages
     bool show_summary = true;        // Show summary at end
@@ -164,6 +169,7 @@ struct Options {
     bool start_index_set = false;    // User explicitly set --start-index/--offset
     bool resume = true;              // Resume file exports from a checkpoint when possible
     bool folder_files = false;       // Export IDA function folders as files/directories
+    bool keep_i64 = false;           // Save the packed .i64 instead of discarding it
 };
 
 static Options g_opts;
@@ -2636,11 +2642,84 @@ public:
         m_active = false;
     }
 
+    // Write directly to the real terminal's stderr, bypassing the /dev/null
+    // redirection that mutes IDA's own output during initialization.
+    void notify(const std::string& msg) const {
+        int fd = (m_active && m_saved_stderr >= 0) ? m_saved_stderr : STDERR_FILENO;
+        posix_write(fd, msg.data(), msg.size());
+    }
+
 private:
     bool m_active;
     int m_saved_stdout;
     int m_saved_stderr;
 };
+
+// Format a duration in seconds as a compact human string (e.g. "12.3s", "3m25s").
+static std::string format_elapsed(double seconds) {
+    std::ostringstream oss;
+    if (seconds < 60.0) {
+        oss << std::fixed << std::setprecision(1) << seconds << "s";
+    } else {
+        int mins = static_cast<int>(seconds) / 60;
+        int secs = static_cast<int>(seconds) % 60;
+        oss << mins << "m" << secs << "s";
+    }
+    return oss.str();
+}
+
+//=============================================================================
+// Interrupt-safe database cleanup
+//
+// IDA loads a binary into an *unpacked* database (<input>.id0/.id1/.id2/.nam/
+// .til). Normal teardown packs/discards these, but if we're killed by a signal
+// (Ctrl+C) that teardown never runs and the loose files are orphaned next to
+// the input. We register the component paths up-front and unlink them from a
+// signal handler, using only async-signal-safe calls (unlink/_exit) on stable
+// strdup'd C strings.
+//=============================================================================
+
+static char* g_db_cleanup_paths[16];
+static volatile sig_atomic_t g_db_cleanup_count = 0;
+
+static inline int posix_unlink(const char* path) {
+#ifdef _WIN32
+    return _unlink(path);
+#else
+    return unlink(path);
+#endif
+}
+
+extern "C" void db_cleanup_signal_handler(int sig) {
+    int count = g_db_cleanup_count;
+    for (int i = 0; i < count; ++i) {
+        if (g_db_cleanup_paths[i]) posix_unlink(g_db_cleanup_paths[i]);
+    }
+    _exit(128 + sig);
+}
+
+// Register the unpacked-database component files for <input_file> and install
+// signal handlers so they're removed on interruption.
+static void install_db_cleanup_handler(const std::string& input_file) {
+    // Only the loose unpacked working files — never .i64/.idb, which may be a
+    // pre-existing packed database and are never written mid-run anyway.
+    static const char* const kExts[] = {
+        ".id0", ".id1", ".id2", ".nam", ".til"
+    };
+    int n = 0;
+    for (const char* ext : kExts) {
+        if (n >= static_cast<int>(sizeof(g_db_cleanup_paths) / sizeof(g_db_cleanup_paths[0]))) break;
+        std::string path = input_file + ext;
+        g_db_cleanup_paths[n++] = strdup(path.c_str());
+    }
+    g_db_cleanup_count = n;
+
+    signal(SIGINT, db_cleanup_signal_handler);
+    signal(SIGTERM, db_cleanup_signal_handler);
+#ifndef _WIN32
+    signal(SIGHUP, db_cleanup_signal_handler);
+#endif
+}
 
 class HeadlessIdaContext {
 public:
@@ -2787,14 +2866,66 @@ public:
 
         enable_console_messages(!g_opts.quiet);
 
-        if (open_database(input_file, true) != 0) {
-            throw std::runtime_error(std::string("Failed to open: ") + input_file);
+        // Loading + auto-analysis can take minutes on large binaries with no
+        // output of its own (IDA's console is muted in file/quiet modes). Run a
+        // lightweight heartbeat thread that ticks elapsed time to the real
+        // terminal so the user knows it's still working. The thread never calls
+        // into IDA (which isn't thread-safe) — it only prints.
+        const bool show_heartbeat = g_opts.quiet;
+        std::filesystem::path input_path(input_file);
+        const std::string display_name = input_path.filename().string();
+
+        std::atomic<bool> analyzing{true};
+        std::thread heartbeat;
+        const auto analysis_start = std::chrono::steady_clock::now();
+
+        if (show_heartbeat) {
+            redirector.notify("\033[36m[*]\033[0m Loading " + display_name +
+                              " and running auto-analysis...\n");
+            heartbeat = std::thread([&]() {
+                int ticks = 0;
+                while (analyzing.load(std::memory_order_relaxed)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    if (!analyzing.load(std::memory_order_relaxed)) break;
+                    if (++ticks % 5 != 0) continue;  // refresh ~once per second
+                    double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - analysis_start).count() / 1000.0;
+                    redirector.notify("\r\033[K\033[36m[*]\033[0m Analyzing " + display_name +
+                                      " \033[90m(" + format_elapsed(elapsed) + " elapsed)\033[0m");
+                }
+            });
         }
+
+        auto stop_heartbeat = [&]() {
+            if (!show_heartbeat) return;
+            analyzing.store(false, std::memory_order_relaxed);
+            if (heartbeat.joinable()) heartbeat.join();
+        };
 
         if (!g_opts.quiet) {
             std::cout << "[*] Waiting for auto-analysis..." << std::endl;
         }
+
+        // Arm interrupt cleanup before the unpacked DB files come into existence.
+        install_db_cleanup_handler(input_file);
+
+        int open_rc = open_database(input_file, true);
+        if (open_rc != 0) {
+            stop_heartbeat();
+            if (show_heartbeat) redirector.notify("\r\033[K");
+            throw std::runtime_error(std::string("Failed to open: ") + input_file);
+        }
+
         auto_wait();
+        stop_heartbeat();
+
+        if (show_heartbeat) {
+            double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - analysis_start).count() / 1000.0;
+            redirector.notify("\r\033[K\033[32m[+]\033[0m Analysis complete: " +
+                              std::to_string(get_func_qty()) + " functions in " +
+                              format_elapsed(elapsed) + "\n");
+        }
         if (!g_opts.quiet) {
             std::cout << "[*] Analysis complete." << std::endl;
         }
@@ -2836,6 +2967,18 @@ public:
             term_hexrays_plugin();
             g_hexrays_available = false;
         }
+
+        // Pack the database into <input>.i64 first if requested; save_database
+        // writes the single packed file while the loose component files remain
+        // the live working set.
+        if (g_opts.keep_i64) {
+            if (!save_database(nullptr, 0)) {
+                std::cerr << "\033[33m[WARNING]\033[0m Failed to save .i64 database\n";
+            }
+        }
+
+        // Always delete the loose unpacked component files (.id0/.id1/.id2/
+        // .nam/.til). With keep_i64 the packed .i64 we just wrote survives this.
         set_database_flag(DBFL_KILL);
         term_database();
 
@@ -2911,13 +3054,15 @@ static void print_usage(const char* prog) {
     std::cout << "  --no-asm                 Don't show assembly\n";
     std::cout << "  --no-mc                  Don't show microcode\n";
     std::cout << "  --no-pseudo              Don't show pseudocode\n";
-    std::cout << "  --no-format-pseudo       Disable C-style formatting for pseudocode\n";
+    std::cout << "  --no-format-pseudo       Disable AStyle formatting for pseudocode\n";
+    std::cout << "  --format-pseudo          Force AStyle formatting (default off for file/dump modes)\n";
     std::cout << "  --asm-only               Show only assembly\n";
     std::cout << "  --mc-only                Show only microcode\n";
     std::cout << "  --pseudo-only            Show only pseudocode\n";
     std::cout << "  --no-color               Disable colored output\n";
     std::cout << "  --no-summary             Don't show summary at end\n";
     std::cout << "  --no-resume              Disable checkpoint resume for file exports\n";
+    std::cout << "  --keep-i64               Save the packed .i64 database next to the input\n";
     std::cout << "  --no-plugins             Don't load user plugins (keeps IDA built-in plugins)\n";
     std::cout << "  --plugin <pattern>       Also load user plugins matching pattern (comma-separated)\n";
     std::cout << "                           Implies --no-plugins. Can be specified multiple times\n";
@@ -3074,6 +3219,11 @@ static bool parse_args(int argc, char* argv[]) {
         }
         else if (arg == "--no-format-pseudo") {
             g_opts.format_pseudocode = false;
+            g_opts.format_pseudo_explicit = true;
+        }
+        else if (arg == "--format-pseudo") {
+            g_opts.format_pseudocode = true;
+            g_opts.format_pseudo_explicit = true;
         }
         else if (arg == "--asm-only") {
             g_opts.show_assembly = true;
@@ -3098,6 +3248,9 @@ static bool parse_args(int argc, char* argv[]) {
         }
         else if (arg == "--no-resume") {
             g_opts.resume = false;
+        }
+        else if (arg == "--keep-i64" || arg == "--keep-idb") {
+            g_opts.keep_i64 = true;
         }
         else if (arg == "--no-plugins") {
             g_opts.no_plugins = true;
@@ -3156,6 +3309,15 @@ static bool parse_args(int argc, char* argv[]) {
         g_opts.show_assembly = asm_selected;
         g_opts.show_microcode = mc_selected;
         g_opts.show_pseudocode = pseudo_selected;
+    }
+
+    // For file-producing dumps (-o / --folder-files / --sybil-dump), skip the
+    // AStyle pass by default: it's pure per-function overhead and the raw
+    // decompiler text is what downstream consumers want. Interactive stdout
+    // dumps keep formatting for readability. --format-pseudo forces it back on.
+    const bool dump_mode = !g_opts.output_file.empty() || g_opts.folder_files || g_opts.sybil_dump;
+    if (dump_mode && !g_opts.format_pseudo_explicit) {
+        g_opts.format_pseudocode = false;
     }
 
     return true;
@@ -3305,6 +3467,10 @@ int main(int argc, char *argv[]) {
                 g_output_file->close();
                 g_output_file.reset();
             }
+            // Tear the database down explicitly: _exit() below skips the ctx
+            // destructor, which is what was leaving the unpacked .id0/.nam/.til
+            // files orphaned next to the input.
+            ctx.shutdown();
             real_fflush(real_stdout);
             real_fflush(real_stderr);
             _exit(0);
