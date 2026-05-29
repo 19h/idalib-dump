@@ -182,6 +182,26 @@ struct Stats {
 
 static Stats g_stats;
 
+// Per-modality output sizes (bytes), collected only in file-producing modes so
+// we can report size statistics once the dump finishes.
+struct ModalityStats {
+    std::vector<size_t> asm_sizes;
+    std::vector<size_t> mc_sizes;
+    std::vector<size_t> pseudo_sizes;
+};
+
+static ModalityStats g_modality_stats;
+
+static inline bool modality_stats_enabled() {
+    return !g_opts.output_file.empty() || g_opts.folder_files || g_opts.sybil_dump;
+}
+
+static inline void record_modality_size(std::vector<size_t> &sizes, size_t bytes) {
+    if (modality_stats_enabled() && bytes > 0) {
+        sizes.push_back(bytes);
+    }
+}
+
 // Output stream (stdout or file)
 static std::ostream* g_output = &std::cout;
 static std::unique_ptr<std::ofstream> g_output_file;
@@ -1141,6 +1161,7 @@ public:
 
         if (g_opts.show_assembly) {
             item.asm_text = collect_assembly(pfn);
+            record_modality_size(g_modality_stats.asm_sizes, item.asm_text.size());
         }
 
         bool needs_decompiler = g_opts.show_microcode || g_opts.show_pseudocode;
@@ -1164,8 +1185,14 @@ public:
                         return false;
                     }
                 } else {
-                    if (g_opts.show_microcode) item.mc = collect_microcode((cfunc_t*)cfunc);
-                    if (g_opts.show_pseudocode) item.pseudo = collect_pseudocode((cfunc_t*)cfunc);
+                    if (g_opts.show_microcode) {
+                        item.mc = collect_microcode((cfunc_t*)cfunc);
+                        record_modality_size(g_modality_stats.mc_sizes, item.mc.size());
+                    }
+                    if (g_opts.show_pseudocode) {
+                        item.pseudo = collect_pseudocode((cfunc_t*)cfunc);
+                        record_modality_size(g_modality_stats.pseudo_sizes, item.pseudo.size());
+                    }
                 }
             }
         }
@@ -1279,13 +1306,16 @@ private:
 
     static void dump_assembly(func_t *pfn) {
         out << CLR(Yellow) << "-- Assembly " << CLR(Dim) << std::string(65, '-') << CLR(Reset) << "\n";
-        out << collect_assembly(pfn);
+        std::string assembly = collect_assembly(pfn);
+        record_modality_size(g_modality_stats.asm_sizes, assembly.size());
+        out << assembly;
         out << "\n";
     }
 
     static void dump_microcode(cfunc_t *cfunc) {
         out << CLR(Yellow) << "-- Microcode " << CLR(Dim) << std::string(64, '-') << CLR(Reset) << "\n";
         std::string microcode = collect_microcode(cfunc);
+        record_modality_size(g_modality_stats.mc_sizes, microcode.size());
         if (!microcode.empty()) {
             out << microcode;
         } else {
@@ -1299,6 +1329,7 @@ private:
             out << CLR(Yellow) << "-- Pseudocode " << CLR(Dim) << std::string(63, '-') << CLR(Reset) << "\n";
         }
         std::string formatted = collect_pseudocode(cfunc);
+        record_modality_size(g_modality_stats.pseudo_sizes, formatted.size());
         std::istringstream stream(formatted);
         std::string line;
         while (std::getline(stream, line)) {
@@ -1950,6 +1981,122 @@ static bool dump_folder_file_plan(const std::vector<FunctionEntry> &plan,
     g_progress.finish();
     std::filesystem::remove(checkpoint_path, ec);
     return true;
+}
+
+//=============================================================================
+// Modality Size Statistics
+//=============================================================================
+
+static std::string human_bytes(double bytes) {
+    const char *units[] = {"B", "KB", "MB", "GB"};
+    int unit = 0;
+    double size = bytes;
+    while (size >= 1024.0 && unit < 3) {
+        size /= 1024.0;
+        ++unit;
+    }
+    std::ostringstream oss;
+    if (unit == 0) {
+        oss << static_cast<long long>(bytes) << " B";
+    } else {
+        oss << std::fixed << std::setprecision(1) << size << " " << units[unit];
+    }
+    return oss.str();
+}
+
+// Nearest-rank percentile over an already-sorted vector.
+static size_t size_percentile(const std::vector<size_t> &sorted, double p) {
+    if (sorted.empty()) return 0;
+    double rank = (p / 100.0) * static_cast<double>(sorted.size());
+    size_t idx = static_cast<size_t>(rank);
+    if (static_cast<double>(idx) < rank) ++idx;   // ceil
+    if (idx < 1) idx = 1;
+    if (idx > sorted.size()) idx = sorted.size();
+    return sorted[idx - 1];
+}
+
+static void print_modality_size_stats(const char *label, std::vector<size_t> sizes) {
+    if (sizes.empty()) return;
+    std::sort(sizes.begin(), sizes.end());
+
+    const size_t n = sizes.size();
+    unsigned long long total = 0;
+    for (size_t s : sizes) total += s;
+    const double mean = static_cast<double>(total) / static_cast<double>(n);
+    const size_t mn = sizes.front();
+    const size_t mx = sizes.back();
+
+    std::cerr << "\n  \033[1m" << label << "\033[0m  \033[90m(" << n
+              << " functions, " << human_bytes(static_cast<double>(total)) << " total)\033[0m\n";
+    std::cerr << "    avg " << human_bytes(mean)
+              << "   min " << human_bytes(static_cast<double>(mn))
+              << "   max " << human_bytes(static_cast<double>(mx)) << "\n";
+
+    const struct { const char *name; double p; } pcts[] = {
+        {"p50", 50.0}, {"p70", 70.0}, {"p80", 80.0}, {"p90", 90.0},
+        {"p95", 95.0}, {"p98", 98.0}, {"p99", 99.0}, {"p99.9", 99.9},
+    };
+    std::cerr << "    ";
+    for (size_t i = 0; i < sizeof(pcts) / sizeof(pcts[0]); ++i) {
+        if (i) std::cerr << "  ";
+        std::cerr << pcts[i].name << " " << human_bytes(static_cast<double>(size_percentile(sizes, pcts[i].p)));
+    }
+    std::cerr << "\n";
+
+    // Distribution of sizes: linear histogram across the observed range.
+    if (mx > mn) {
+        const int bins = 10;
+        const int bar_max = 40;
+        std::vector<size_t> counts(bins, 0);
+        const double width = static_cast<double>(mx - mn) / bins;
+        for (size_t s : sizes) {
+            int b = static_cast<int>(static_cast<double>(s - mn) / width);
+            if (b >= bins) b = bins - 1;
+            if (b < 0) b = 0;
+            counts[b]++;
+        }
+        size_t peak = 0;
+        for (size_t c : counts) peak = std::max(peak, c);
+
+        std::cerr << "    distribution:\n";
+        for (int b = 0; b < bins; ++b) {
+            const size_t lo = mn + static_cast<size_t>(width * b);
+            const size_t hi = (b == bins - 1) ? mx : mn + static_cast<size_t>(width * (b + 1));
+            const int bar_len = peak ? static_cast<int>(static_cast<double>(counts[b]) / peak * bar_max) : 0;
+            std::cerr << "      " << std::setw(10) << human_bytes(static_cast<double>(lo))
+                      << " - " << std::setw(10) << human_bytes(static_cast<double>(hi))
+                      << " \033[90m│\033[0m \033[32m" << std::string(bar_len, '#') << "\033[0m "
+                      << counts[b] << "\n";
+        }
+    }
+}
+
+// In file-producing modes the normal summary (which lists decompilation
+// errors) is suppressed, so surface the per-function errors on stderr instead.
+static void print_error_report() {
+    if (!modality_stats_enabled()) return;
+    if (g_stats.errors.empty()) return;
+
+    std::cerr << "\n\033[31mErrors (" << g_stats.errors.size() << "):\033[0m\n";
+    for (const auto &err : g_stats.errors) {
+        std::cerr << "  \033[36m" << err.first << "\033[0m: " << err.second << "\n";
+    }
+}
+
+static void print_modality_size_report() {
+    if (!modality_stats_enabled()) return;
+    if (g_modality_stats.asm_sizes.empty() &&
+        g_modality_stats.mc_sizes.empty() &&
+        g_modality_stats.pseudo_sizes.empty()) {
+        return;
+    }
+
+    std::cerr << "\n\033[1m" << std::string(60, '=') << "\033[0m\n";
+    std::cerr << "\033[1mFunction size statistics\033[0m\n";
+    print_modality_size_stats("Disassembly", g_modality_stats.asm_sizes);
+    print_modality_size_stats("Microcode", g_modality_stats.mc_sizes);
+    print_modality_size_stats("Pseudocode", g_modality_stats.pseudo_sizes);
+    std::cerr << "\n";
 }
 
 //=============================================================================
@@ -3149,6 +3296,8 @@ int main(int argc, char *argv[]) {
                     g_progress.finish();
                 }
             }
+            print_error_report();
+            print_modality_size_report();
             sybil_completed = true;
             std::cout.flush();
             std::cerr.flush();
@@ -3272,6 +3421,9 @@ int main(int argc, char *argv[]) {
                 std::filesystem::remove(checkpoint_path, ec);
             }
         }
+
+        print_error_report();
+        print_modality_size_report();
 
         if (g_opts.show_summary && !g_opts.list_functions && show_console_info) {
             print_summary();
