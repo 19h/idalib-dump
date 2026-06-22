@@ -92,9 +92,10 @@ else()
     set(IDA_LIB_PATH "${IDA_LIB_DIR}/${IDA_LIB_NAME}")
     set(IDALIB_PATH "${IDA_LIB_DIR}/${IDALIB_NAME}")
 
-    # Recent Linux SDK dumps may ship compiler-neutral library directories such
-    # as x64_linux_64 instead of x64_linux_clang_64/x64_linux_gcc_64.
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+    # Recent SDK dumps may ship compiler-neutral library directories such as
+    # x64_linux_64 / arm64_mac_64 instead of the compiler-qualified
+    # x64_linux_clang_64 / arm64_mac_clang_64 names.
+    if((CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin") AND
        (NOT EXISTS "${IDA_LIB_PATH}" OR NOT EXISTS "${IDALIB_PATH}"))
         set(_ida_lib_fallbacks
             "${IDA_ARCH}_${IDA_PLATFORM_NAME}_64"

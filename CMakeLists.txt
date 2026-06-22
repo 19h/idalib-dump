@@ -121,6 +121,28 @@ if(APPLE)
     target_link_options(ida_lumina_debug PRIVATE -Wl,-flat_namespace)
 endif()
 
+# INTERR hunter: single-file or recursive microcode/internal-error scan
+ida_add_idalib(ida_interr
+  TYPE EXECUTABLE
+  SOURCES
+    src/interr.cpp
+    src/noplugins.c
+)
+
+target_compile_features(ida_interr PRIVATE cxx_std_17)
+if(NOT WIN32)
+    target_link_libraries(ida_interr PRIVATE dl)
+endif()
+if(APPLE)
+    target_link_options(ida_interr PRIVATE -Wl,-flat_namespace)
+endif()
+
+# Create 'idainterr' as a copy of ida_interr
+add_custom_command(TARGET ida_interr POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:ida_interr> ${CMAKE_BINARY_DIR}/idainterr$<TARGET_FILE_SUFFIX:ida_interr>
+    COMMENT "Creating idainterr"
+)
+
 # Telegram Lumina Bot (optional, requires TDLib, Linux only)
 option(BUILD_LUMINA_BOT "Build the Telegram Lumina bot (requires TDLib)" OFF)
 
