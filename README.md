@@ -15,6 +15,7 @@ A headless IDA Pro toolset for binary analysis. Built on top of `idalib`, it run
 - **Flexible filtering**: Filter functions by name (regex), address, or explicit list
 - **File output**: Write to file with real-time progress display
 - **Error detection**: Find decompilation failures across a binary
+- **Internal error scan**: `--interr` reports functions that trigger decompiler internal errors without aborting the run
 - **Plugin control**: Disable user plugins or selectively enable specific ones
 - **Lumina integration**: Push function metadata to Hex-Rays' Lumina server or inspect the local metadata that would be hashed
 
@@ -96,6 +97,7 @@ By default, assembly and pseudocode are shown. Use these flags to customize:
 | `-o, --output <file>` | Write output to file (shows progress on stderr) |
 | `-O, --output-dir <dir>` | Export IDA function folders into files under a directory |
 | `--folder-files` | Treat source-like function folders as aggregate files |
+| `--interr` | Decompile every function and report internal errors (implies `--pseudo`) |
 | `-q, --quiet` | Suppress IDA messages and binary info |
 | `-v, --verbose` | Show extra metadata (size, flags, segments) |
 | `--no-format-pseudo` | Disable AStyle formatting of pseudocode |
@@ -118,6 +120,30 @@ functions directly under a non-source folder are grouped into `<folder>.c` (or
 the active output extension); root functions are grouped into `root.c`.
 directory export writes a checkpoint at `<output-dir>/.idalib-dump.progress`
 and resumes from the last complete function on rerun.
+
+### Internal error scan
+
+`--interr` is a dedicated mode for finding functions that make the decompiler
+trip an internal error (INTERR) — useful for stress-testing a lifter or plugin
+(e.g. the AVX lifter). It decompiles every selected function (honoring the
+filtering options above), captures both soft `MERR_INTERR` failures and hard
+`interr()` aborts instead of letting them terminate the process, and keeps
+scanning the rest. It implies `--pseudo` so the full ctree/pseudocode path is
+exercised.
+
+Each offending function is reported as one line — `<address>  INTERR <code>
+<name>` — to stderr by default, or to a file when `-o <file>` is given. A
+one-line summary always goes to stderr, and the process exits non-zero when any
+internal error was found (ordinary decompilation failures do not count), so it
+can gate a CI run. `--interr` cannot be combined with `--folder-files`,
+`--sybil`/`--sybil-dump`, or `--list`.
+
+> Soft internal errors (the decompiler's own `MERR_INTERR`) recover cleanly and
+> the scan continues normally. Hard internal errors (a kernel/verifier
+> `interr()` abort, caught via `set_interr_throws`) are best-effort: IDA gives no
+> guarantee the engine is reusable afterwards, so functions decompiled later in
+> the same run may be less reliable. For a clean enumeration past such a point,
+> re-run with `--start-index` set past the offending function.
 
 ### Plugin Control
 
@@ -151,6 +177,12 @@ ida_dump -f 'parse_.*' program.exe
 
 # Dump function at specific address
 ida_dump -a 0x140001000 program.exe
+
+# Scan every function for decompiler internal errors (INTERRs)
+ida_dump --interr program.exe
+
+# ...and write the offending functions to a file (summary still on stderr)
+ida_dump --interr -o interrs.txt program.exe
 
 # Find decompilation errors
 ida_dump -e program.exe
@@ -302,6 +334,10 @@ A summary at the end shows total functions processed, success/failure counts, an
 
 - `0`: All processed functions decompiled successfully
 - `1`: One or more decompilation failures occurred
+
+With `--interr` the exit code reflects internal errors only: `0` when no INTERR
+was found (ordinary decompilation failures do **not** count), `1` when at least
+one INTERR was found — so it can gate a CI run.
 
 ## License
 

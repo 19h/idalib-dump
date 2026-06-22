@@ -170,6 +170,7 @@ struct Options {
     bool resume = true;              // Resume file exports from a checkpoint when possible
     bool folder_files = false;       // Export IDA function folders as files/directories
     bool keep_i64 = false;           // Save the packed .i64 instead of discarding it
+    bool interr_scan = false;        // Decompile all functions and report internal errors
 };
 
 static Options g_opts;
@@ -328,7 +329,8 @@ private:
 
     bool should_show() const {
         // Show progress when outputting to file (progress goes to stderr)
-        return !g_opts.output_file.empty() || g_opts.folder_files || g_opts.sybil_dump;
+        return !g_opts.output_file.empty() || g_opts.folder_files ||
+               g_opts.sybil_dump || g_opts.interr_scan;
     }
 
     static std::string format_duration(double seconds) {
@@ -1990,6 +1992,177 @@ static bool dump_folder_file_plan(const std::vector<FunctionEntry> &plan,
 }
 
 //=============================================================================
+// Internal Error (INTERR) Scan
+//
+// A buggy lifter or plugin can make the decompiler trip an internal consistency
+// check. That surfaces two ways: a soft failure with hexrays_failure_t::code ==
+// MERR_INTERR, or a hard interr() which by default aborts the whole process.
+// set_interr_throws(true) turns the hard variant into a catchable interr_exc_t,
+// so we can record the offending function and keep scanning the rest.
+//=============================================================================
+
+struct InterrRecord {
+    ea_t address = BADADDR;
+    int code = 0;            // INTERR / MERR_INTERR code
+    std::string name;
+};
+
+static std::string format_elapsed(double seconds);  // defined further below
+
+static size_t g_interr_found = 0;  // INTERRs seen during the last scan
+
+// Decompile one function with internal errors caught. Returns true and fills
+// `rec` when the function triggers an internal error; false otherwise. Ordinary
+// decompilation failures (any MERR_ other than MERR_INTERR) are not of interest
+// here and are silently ignored.
+static bool scan_function_for_interr(func_t *pfn, InterrRecord &rec) {
+    if (!pfn) return false;
+
+    qstring fname;
+    get_func_name(&fname, pfn->start_ea);
+
+    try {
+        hexrays_failure_t hf;
+        cfuncptr_t cfunc = decompile(pfn, &hf, DECOMP_WARNINGS);
+        if (cfunc != nullptr) {
+            // Force pseudocode generation: some internal errors only fire while
+            // building the ctree or printing, not during microcode synthesis.
+            cfunc->get_pseudocode();
+            g_stats.decompiled_ok++;
+            return false;
+        }
+
+        g_stats.decompiled_fail++;
+        if (hf.code == MERR_INTERR) {
+            rec.address = pfn->start_ea;
+            rec.code = (int)hf.code;
+            rec.name = fname.c_str();
+            return true;
+        }
+    } catch (const interr_exc_t &e) {
+        // Hard internal error (e.g. a failed verifier assertion) turned into a
+        // throw by set_interr_throws(). We record it and keep scanning so a
+        // single run can enumerate every offender, but the SDK gives no promise
+        // that the engine is left reusable after this, so functions decompiled
+        // afterwards are best-effort. Re-run with --start-index past an offender
+        // for a clean result (see README).
+        g_stats.decompiled_fail++;
+        rec.address = pfn->start_ea;
+        rec.code = e.code;
+        rec.name = fname.c_str();
+        return true;
+    } catch (const vd_failure_t &e) {
+        // Decompiler exception (only thrown when no hf out-param is used, but
+        // handled defensively); record only internal errors.
+        g_stats.decompiled_fail++;
+        if (e.hf.code == MERR_INTERR) {
+            rec.address = pfn->start_ea;
+            rec.code = (int)e.hf.code;
+            rec.name = fname.c_str();
+            return true;
+        }
+    } catch (...) {
+        // Any other failure during decompilation; keep scanning.
+        g_stats.decompiled_fail++;
+    }
+
+    return false;
+}
+
+// Emit the collected internal errors to the report sink: the -o file when one
+// was given, otherwise stderr. Record lines honor Color::enabled, which main()
+// disables for file output so the file stays plain. The single summary line
+// always goes to stderr and uses raw ANSI, matching the other stderr status
+// lines (ProgressDisplay::finish, print_error_report) which color the terminal
+// regardless of file output.
+static bool write_interr_report(const std::vector<InterrRecord> &interrs,
+                                double elapsed) {
+    std::ofstream file;
+    std::ostream *os = &std::cerr;
+    const bool to_file = !g_opts.output_file.empty();
+
+    if (to_file) {
+        file.open(g_opts.output_file,
+                  std::ios::out | std::ios::trunc | std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "Error: Cannot open output file: "
+                      << g_opts.output_file << "\n";
+            return false;
+        }
+        os = &file;
+    }
+
+    for (const auto &rec : interrs) {
+        *os << CLR(Red) << format_address(rec.address) << CLR(Reset)
+            << "  INTERR " << rec.code
+            << "  " << CLR(Cyan) << rec.name << CLR(Reset) << "\n";
+    }
+
+    if (to_file) {
+        file.flush();
+        if (!file) {
+            std::cerr << "Error: Failed to write output file: "
+                      << g_opts.output_file << "\n";
+            return false;
+        }
+    }
+
+    if (interrs.empty()) {
+        std::cerr << "\033[32m\xe2\x9c\x93 No internal errors\033[0m across "
+                  << g_stats.processed << " functions in \033[36m"
+                  << format_elapsed(elapsed) << "\033[0m\n";
+    } else {
+        std::cerr << "\033[31m" << interrs.size() << " internal error"
+                  << (interrs.size() == 1 ? "" : "s") << "\033[0m across "
+                  << g_stats.processed << " functions in \033[36m"
+                  << format_elapsed(elapsed) << "\033[0m";
+        if (to_file) {
+            std::cerr << " \033[90m\xe2\x86\x92\033[0m \033[33m"
+                      << g_opts.output_file << "\033[0m";
+        }
+        std::cerr << "\n";
+    }
+    return true;
+}
+
+// Decompile every selected function, catching internal errors so the scan can
+// run to completion, then emit the report.
+static bool run_interr_scan(const std::vector<FunctionEntry> &plan,
+                            const FunctionRange &range) {
+    if (!g_hexrays_available) {
+        std::cerr << "Error: --interr requires the Hex-Rays decompiler\n";
+        return false;
+    }
+
+    const bool prev_throws = set_interr_throws(true);
+    std::vector<InterrRecord> interrs;
+    const auto scan_start = std::chrono::steady_clock::now();
+
+    for (size_t i = range.begin; i < range.end; ++i) {
+        const FunctionEntry &entry = plan[i];
+        InterrRecord rec;
+        if (scan_function_for_interr(entry.pfn, rec)) {
+            interrs.push_back(std::move(rec));
+        }
+        g_stats.processed = (i + 1) - range.begin;
+        g_progress.update(g_stats.processed, entry.name);
+    }
+
+    set_interr_throws(prev_throws);
+
+    const double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - scan_start).count() / 1000.0;
+
+    // Clear the progress bar's last line; write_interr_report owns the single
+    // summary line so there's no misleading "N ok / 0 B" finish() line for a
+    // scan whose real result is the report below.
+    std::cerr << "\r\033[K";
+
+    g_interr_found = interrs.size();
+    return write_interr_report(interrs, elapsed);
+}
+
+//=============================================================================
 // Modality Size Statistics
 //=============================================================================
 
@@ -3063,10 +3236,12 @@ static void print_usage(const char* prog) {
     std::cout << "  --no-summary             Don't show summary at end\n";
     std::cout << "  --no-resume              Disable checkpoint resume for file exports\n";
     std::cout << "  --keep-i64               Save the packed .i64 database next to the input\n";
+    std::cout << "  --interr                 Decompile all functions; report internal errors (implies --pseudo)\n";
+    std::cout << "                           Writes to stderr, or to a file with -o\n";
     std::cout << "  --no-plugins             Don't load user plugins (keeps IDA built-in plugins)\n";
     std::cout << "  --plugin <pattern>       Also load user plugins matching pattern (comma-separated)\n";
     std::cout << "                           Implies --no-plugins. Can be specified multiple times\n";
-     std::cout << "  -h, --help               Show this help\n";
+    std::cout << "  -h, --help               Show this help\n";
     std::cout << "  --version                Show build info (SDK path, runtime lib path)\n";
     std::cout << "\n";
     std::cout << CLR(Cyan) << "Examples:" << CLR(Reset) << "\n";
@@ -3078,6 +3253,8 @@ static void print_usage(const char* prog) {
     std::cout << "  " << prog << " -l program.exe                     # List exporter-order indexes\n";
     std::cout << "  " << prog << " -o out.c --start-index 100 --count 50 program.exe\n";
     std::cout << "  " << prog << " -e program.exe                     # Only show errors\n";
+    std::cout << "  " << prog << " --interr program.exe               # Report decompiler internal errors\n";
+    std::cout << "  " << prog << " --interr -o interrs.txt program.exe # ...and write them to a file\n";
     std::cout << "\n";
 }
 
@@ -3252,6 +3429,9 @@ static bool parse_args(int argc, char* argv[]) {
         else if (arg == "--keep-i64" || arg == "--keep-idb") {
             g_opts.keep_i64 = true;
         }
+        else if (arg == "--interr") {
+            g_opts.interr_scan = true;
+        }
         else if (arg == "--no-plugins") {
             g_opts.no_plugins = true;
         }
@@ -3303,12 +3483,33 @@ static bool parse_args(int argc, char* argv[]) {
         std::cerr << "Error: --sybil/--sybil-dump cannot be combined with --folder-files\n";
         return false;
     }
+    if (g_opts.interr_scan) {
+        if (g_opts.folder_files) {
+            std::cerr << "Error: --interr cannot be combined with --output-dir/--folder-files\n";
+            return false;
+        }
+        if (g_opts.sybil_embeddings || g_opts.sybil_dump) {
+            std::cerr << "Error: --interr cannot be combined with --sybil/--sybil-dump\n";
+            return false;
+        }
+        if (g_opts.list_functions) {
+            std::cerr << "Error: --interr cannot be combined with --list\n";
+            return false;
+        }
+    }
 
     // If user explicitly selected any outputs, show only those selections.
     if (asm_selected || mc_selected || pseudo_selected) {
         g_opts.show_assembly = asm_selected;
         g_opts.show_microcode = mc_selected;
         g_opts.show_pseudocode = pseudo_selected;
+    }
+
+    // --interr drives full decompilation to surface internal errors; generating
+    // pseudocode is the most thorough path, so it implies --pseudo regardless of
+    // any explicit modality selection above.
+    if (g_opts.interr_scan) {
+        g_opts.show_pseudocode = true;
     }
 
     // For file-producing dumps (-o / --folder-files / --sybil-dump), skip the
@@ -3347,6 +3548,14 @@ int main(int argc, char *argv[]) {
 
     if (g_opts.sybil_embeddings || g_opts.sybil_dump) {
         Color::disable();
+        g_opts.quiet = true;
+    }
+
+    // INTERR scan: silence IDA's own console (including the internal-error
+    // banner it prints before throwing) so it doesn't pollute our report.
+    // Colors stay on for the stderr report unless -o sends it to a file, which
+    // the output_file branch above already handles by disabling them.
+    if (g_opts.interr_scan) {
         g_opts.quiet = true;
     }
 
@@ -3488,6 +3697,10 @@ int main(int argc, char *argv[]) {
                 FunctionDumper::list(export_plan[i].pfn, export_plan[i].index);
             }
             std::cout << "\n";
+        } else if (g_opts.interr_scan) {
+            if (!run_interr_scan(export_plan, function_range)) {
+                return EXIT_FAILURE;
+            }
         } else if (g_opts.folder_files) {
             if (!dump_folder_file_plan(export_plan, function_range)) {
                 return EXIT_FAILURE;
@@ -3617,6 +3830,12 @@ int main(int argc, char *argv[]) {
         real_fflush(real_stdout);
         real_fflush(real_stderr);
         _exit(0);
+    }
+
+    if (g_opts.interr_scan) {
+        // Exit nonzero only when internal errors were actually found, so CI can
+        // gate on a clean run (ordinary decompilation failures don't count).
+        return g_interr_found > 0 ? EXIT_FAILURE : EXIT_SUCCESS;
     }
 
     return g_stats.decompiled_fail > 0 ? EXIT_FAILURE : EXIT_SUCCESS;
