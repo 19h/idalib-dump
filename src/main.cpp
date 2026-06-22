@@ -34,6 +34,7 @@
 #include <atomic>
 #include <csignal>
 #include <limits>
+#include <cmath>
 #include <unordered_map>
 
 // Save real setenv/getenv and FILE* pointers before IDA SDK redefines them with macros
@@ -166,6 +167,7 @@ struct Options {
     bool no_plugins = false;         // Disable loading user plugins
     bool sybil_embeddings = false;   // Hidden: request embeddings instead of dumping
     bool sybil_dump = false;         // Hidden: write would-be-sent payloads to JSONL
+    bool sybil_stats = false;        // Hidden: run embeddings but report only stats, suppress response
     bool start_index_set = false;    // User explicitly set --start-index/--offset
     bool resume = true;              // Resume file exports from a checkpoint when possible
     bool folder_files = false;       // Export IDA function folders as files/directories
@@ -194,12 +196,14 @@ struct ModalityStats {
     std::vector<size_t> asm_sizes;
     std::vector<size_t> mc_sizes;
     std::vector<size_t> pseudo_sizes;
+    std::vector<size_t> emb_sizes;    // Embedding response payload sizes (bytes)
 };
 
 static ModalityStats g_modality_stats;
 
 static inline bool modality_stats_enabled() {
-    return !g_opts.output_file.empty() || g_opts.folder_files || g_opts.sybil_dump;
+    return !g_opts.output_file.empty() || g_opts.folder_files ||
+           g_opts.sybil_dump || g_opts.sybil_stats;
 }
 
 static inline void record_modality_size(std::vector<size_t> &sizes, size_t bytes) {
@@ -327,8 +331,12 @@ private:
     size_t m_total = 0;
 
     bool should_show() const {
-        // Show progress when outputting to file (progress goes to stderr)
-        return !g_opts.output_file.empty() || g_opts.folder_files || g_opts.sybil_dump;
+        // Show progress when outputting to file (progress goes to stderr).
+        // Sybil embedding runs stream responses to stdout, so the stderr
+        // progress bar is safe to show even without an output file -- it's the
+        // only feedback during the up-front decompile of every function.
+        return !g_opts.output_file.empty() || g_opts.folder_files ||
+               g_opts.sybil_dump || g_opts.sybil_embeddings;
     }
 
     static std::string format_duration(double seconds) {
@@ -1677,10 +1685,28 @@ static std::vector<FunctionEntry> collect_folder_file_export_plan() {
     return plan;
 }
 
+// Order the plan from the smallest function to the largest so that cheap,
+// fast-to-decompile functions are processed first. Size is the function's
+// primary chunk extent (end_ea - start_ea); start_ea breaks ties for a stable,
+// reproducible order (the export-plan signature depends on this ordering).
+static void sort_plan_by_size(std::vector<FunctionEntry> &plan) {
+    std::stable_sort(plan.begin(), plan.end(),
+                     [](const FunctionEntry &a, const FunctionEntry &b) {
+                         asize_t size_a = a.end_ea - a.start_ea;
+                         asize_t size_b = b.end_ea - b.start_ea;
+                         if (size_a != size_b) return size_a < size_b;
+                         return a.start_ea < b.start_ea;
+                     });
+    for (size_t i = 0; i < plan.size(); ++i) {
+        plan[i].index = i;
+    }
+}
+
 static std::vector<FunctionEntry> collect_active_export_plan() {
     if (g_opts.folder_files) {
         std::vector<FunctionEntry> plan = collect_folder_file_export_plan();
         if (!plan.empty()) {
+            sort_plan_by_size(plan);
             return plan;
         }
         std::cerr << "\033[33mWarning: Function folder tree is empty; "
@@ -1690,9 +1716,12 @@ static std::vector<FunctionEntry> collect_active_export_plan() {
             entry.tree_path = "/" + entry.name;
         }
         assign_folder_file_output_paths(plan);
+        sort_plan_by_size(plan);
         return plan;
     }
-    return collect_export_plan();
+    std::vector<FunctionEntry> plan = collect_export_plan();
+    sort_plan_by_size(plan);
+    return plan;
 }
 
 static FunctionRange selected_function_range(size_t plan_size) {
@@ -2049,14 +2078,38 @@ static void print_modality_size_stats(const char *label, std::vector<size_t> siz
     }
     std::cerr << "\n";
 
-    // Distribution of sizes: linear histogram across the observed range.
+    // Distribution of sizes. Size data is typically heavy-tailed (most functions
+    // small, a few huge), so a linear histogram wastes most buckets on the empty
+    // tail and crushes the bulk into the first bucket. Switch to log-spaced
+    // buckets once the range spans more than ~20x so resolution lands where the
+    // data actually concentrates; keep linear for tightly-clustered data (e.g.
+    // fixed-dimension embeddings) where log would collapse everything.
     if (mx > mn) {
         const int bins = 10;
         const int bar_max = 40;
+        const bool use_log = mn > 0 &&
+            static_cast<double>(mx) / static_cast<double>(mn) >= 20.0;
+
+        // Bucket edges (size bins+1). For log scale, edges are geometric.
+        std::vector<double> edges(bins + 1);
+        const double lmin = use_log ? std::log(static_cast<double>(mn)) : 0.0;
+        const double lmax = use_log ? std::log(static_cast<double>(mx)) : 0.0;
+        for (int b = 0; b <= bins; ++b) {
+            double f = static_cast<double>(b) / bins;
+            edges[b] = use_log ? std::exp(lmin + (lmax - lmin) * f)
+                               : static_cast<double>(mn) +
+                                     (static_cast<double>(mx) - static_cast<double>(mn)) * f;
+        }
+        edges[0] = static_cast<double>(mn);
+        edges[bins] = static_cast<double>(mx);
+
         std::vector<size_t> counts(bins, 0);
-        const double width = static_cast<double>(mx - mn) / bins;
+        const double span = use_log ? (lmax - lmin)
+                                    : (static_cast<double>(mx) - static_cast<double>(mn));
         for (size_t s : sizes) {
-            int b = static_cast<int>(static_cast<double>(s - mn) / width);
+            double pos = use_log ? (std::log(static_cast<double>(s)) - lmin)
+                                 : (static_cast<double>(s) - static_cast<double>(mn));
+            int b = span > 0 ? static_cast<int>(pos / span * bins) : 0;
             if (b >= bins) b = bins - 1;
             if (b < 0) b = 0;
             counts[b]++;
@@ -2064,10 +2117,10 @@ static void print_modality_size_stats(const char *label, std::vector<size_t> siz
         size_t peak = 0;
         for (size_t c : counts) peak = std::max(peak, c);
 
-        std::cerr << "    distribution:\n";
+        std::cerr << "    distribution" << (use_log ? " \033[90m(log scale)\033[0m" : "") << ":\n";
         for (int b = 0; b < bins; ++b) {
-            const size_t lo = mn + static_cast<size_t>(width * b);
-            const size_t hi = (b == bins - 1) ? mx : mn + static_cast<size_t>(width * (b + 1));
+            const size_t lo = static_cast<size_t>(edges[b]);
+            const size_t hi = static_cast<size_t>(edges[b + 1]);
             const int bar_len = peak ? static_cast<int>(static_cast<double>(counts[b]) / peak * bar_max) : 0;
             std::cerr << "      " << std::setw(10) << human_bytes(static_cast<double>(lo))
                       << " - " << std::setw(10) << human_bytes(static_cast<double>(hi))
@@ -2093,7 +2146,8 @@ static void print_modality_size_report() {
     if (!modality_stats_enabled()) return;
     if (g_modality_stats.asm_sizes.empty() &&
         g_modality_stats.mc_sizes.empty() &&
-        g_modality_stats.pseudo_sizes.empty()) {
+        g_modality_stats.pseudo_sizes.empty() &&
+        g_modality_stats.emb_sizes.empty()) {
         return;
     }
 
@@ -2102,6 +2156,7 @@ static void print_modality_size_report() {
     print_modality_size_stats("Disassembly", g_modality_stats.asm_sizes);
     print_modality_size_stats("Microcode", g_modality_stats.mc_sizes);
     print_modality_size_stats("Pseudocode", g_modality_stats.pseudo_sizes);
+    print_modality_size_stats("Embedding", g_modality_stats.emb_sizes);
     std::cerr << "\n";
 }
 
@@ -2521,7 +2576,13 @@ static void write_sybil_export(const std::vector<SybilFunctionInput> &items,
     out << "]\n";
 }
 
-static bool request_sybil_embeddings(const std::vector<SybilFunctionInput> &items,
+// Stream embeddings: decompile functions from `plan[range]` lazily, sending each
+// batch as soon as enough inputs are collected rather than decompiling the whole
+// plan up front. `items` is grown in place (kept for the caller's later export);
+// `embeddings` accumulates the per-function vectors when writing to a file.
+static bool request_sybil_embeddings(const std::vector<FunctionEntry> &plan,
+                                     const FunctionRange &range,
+                                     std::vector<SybilFunctionInput> &items,
                                      std::vector<std::string> &embeddings) {
     constexpr size_t kInitialBatchItems = 8;
     constexpr size_t kMaxRetryAttempts = 8;
@@ -2529,8 +2590,26 @@ static bool request_sybil_embeddings(const std::vector<SybilFunctionInput> &item
     size_t max_batch_items = kInitialBatchItems;
     size_t retry_attempts = 0;
     size_t batch_begin = 0;
+    size_t plan_cursor = range.begin;
 
-    while (batch_begin < items.size()) {
+    // Decompile additional plan entries until `items` holds at least `want`
+    // collected inputs or the plan is exhausted, ticking the progress bar per
+    // function so the terminal isn't silent during the decompile phase.
+    auto ensure_collected = [&](size_t want) {
+        while (items.size() < want && plan_cursor < range.end) {
+            const FunctionEntry &entry = plan[plan_cursor++];
+            SybilFunctionInput item;
+            if (FunctionDumper::collect_sybil_input(entry.pfn, item)) {
+                items.push_back(std::move(item));
+            }
+            g_stats.processed = plan_cursor - range.begin;
+            g_progress.update(g_stats.processed, entry.name);
+        }
+    };
+
+    while (true) {
+        ensure_collected(batch_begin + max_batch_items);
+        if (batch_begin >= items.size()) break;  // plan exhausted, nothing left
         size_t batch_end = std::min(items.size(), batch_begin + max_batch_items);
 
         std::string response;
@@ -2538,7 +2617,7 @@ static bool request_sybil_embeddings(const std::vector<SybilFunctionInput> &item
         std::string request_json = build_sybil_request_json(items, batch_begin, batch_end);
         if (!g_opts.output_file.empty()) {
             std::cerr << "\r\033[KSybil request " << (batch_begin + 1)
-                      << "-" << batch_end << "/" << items.size() << "..."
+                      << "-" << batch_end << "/" << range.size() << "..."
                       << std::flush;
         }
         if (!run_curl_post_json(endpoint_url, request_json, response, error)) {
@@ -2547,7 +2626,11 @@ static bool request_sybil_embeddings(const std::vector<SybilFunctionInput> &item
             return false;
         }
 
-        if (g_opts.output_file.empty()) {
+        // Without an output file the raw response normally streams to stdout.
+        // --sybil-stats suppresses that, instead extracting/validating the
+        // embeddings (same error handling as the file path) and recording only
+        // their sizes for the end-of-run statistics.
+        if (g_opts.output_file.empty() && !g_opts.sybil_stats) {
             std::cout << response;
             if (!response.empty() && response.back() != '\n') std::cout << "\n";
         } else {
@@ -2586,7 +2669,17 @@ static bool request_sybil_embeddings(const std::vector<SybilFunctionInput> &item
                 std::cerr << "Response preview: " << response_preview(response) << "\n";
                 return false;
             }
-            embeddings.insert(embeddings.end(), batch_embeddings.begin(), batch_embeddings.end());
+            for (const std::string &emb : batch_embeddings) {
+                record_modality_size(g_modality_stats.emb_sizes, emb.size());
+            }
+            if (g_opts.sybil_stats) {
+                // No file is written, so surface received bytes on the progress bar.
+                for (const std::string &emb : batch_embeddings) {
+                    g_stats.output_bytes += emb.size();
+                }
+            } else {
+                embeddings.insert(embeddings.end(), batch_embeddings.begin(), batch_embeddings.end());
+            }
         }
 
         retry_attempts = 0;
@@ -3162,6 +3255,9 @@ static bool parse_args(int argc, char* argv[]) {
             g_opts.sybil_dump_file = argv[++i];
             g_opts.sybil_dump = true;
         }
+        else if (arg == "--sybil-stats") {
+            g_opts.sybil_stats = true;
+        }
         else if (arg == "-e" || arg == "--errors") {
             g_opts.errors_only = true;
         }
@@ -3287,6 +3383,14 @@ static bool parse_args(int argc, char* argv[]) {
         std::cerr << "Error: --sybil cannot be combined with --sybil-dump\n";
         return false;
     }
+    if (g_opts.sybil_stats && !g_opts.sybil_embeddings) {
+        std::cerr << "Error: --sybil-stats requires --sybil <url>\n";
+        return false;
+    }
+    if (g_opts.sybil_stats && !g_opts.output_file.empty()) {
+        std::cerr << "Error: --sybil-stats cannot be combined with --output\n";
+        return false;
+    }
     if ((g_opts.sybil_embeddings || g_opts.sybil_dump) && g_opts.list_functions) {
         std::cerr << "Error: --sybil/--sybil-dump cannot be combined with --list\n";
         return false;
@@ -3398,35 +3502,29 @@ int main(int argc, char *argv[]) {
         }
 
         if (g_opts.sybil_embeddings || g_opts.sybil_dump) {
-            // Progress is shown on stderr whenever output isn't streamed to
-            // stdout (i.e. a file is being written, including the JSONL dump).
-            const bool report_progress = !g_opts.output_file.empty() || g_opts.sybil_dump;
+            if (g_opts.sybil_dump) {
+                // Dump path: the whole input set is written to one JSONL file, so
+                // collect every function up front, then write.
+                std::vector<SybilFunctionInput> sybil_inputs;
+                sybil_inputs.reserve(function_range.size());
 
-            std::vector<SybilFunctionInput> sybil_inputs;
-            sybil_inputs.reserve(function_range.size());
+                for (size_t i = function_range.begin; i < function_range.end; ++i) {
+                    const FunctionEntry &entry = export_plan[i];
 
-            for (size_t i = function_range.begin; i < function_range.end; ++i) {
-                const FunctionEntry &entry = export_plan[i];
+                    SybilFunctionInput item;
+                    if (FunctionDumper::collect_sybil_input(entry.pfn, item)) {
+                        sybil_inputs.push_back(std::move(item));
+                    }
 
-                SybilFunctionInput item;
-                bool collected = FunctionDumper::collect_sybil_input(entry.pfn, item);
-                if (collected) {
-                    sybil_inputs.push_back(std::move(item));
-                }
-
-                if (report_progress) {
                     g_stats.processed = (i + 1) - function_range.begin;
                     g_progress.update(g_stats.processed, entry.name);
                 }
-            }
 
-            if (sybil_inputs.empty()) {
-                std::cerr << "Error: No functions available for Sybil "
-                          << (g_opts.sybil_dump ? "payload dump" : "embedding request") << "\n";
-                return EXIT_FAILURE;
-            }
+                if (sybil_inputs.empty()) {
+                    std::cerr << "Error: No functions available for Sybil payload dump\n";
+                    return EXIT_FAILURE;
+                }
 
-            if (g_opts.sybil_dump) {
                 std::cerr << "\r\033[KCollected " << sybil_inputs.size()
                           << " functions; writing payloads to " << g_opts.sybil_dump_file << "...\n";
                 if (!write_sybil_jsonl(sybil_inputs)) {
@@ -3434,13 +3532,19 @@ int main(int argc, char *argv[]) {
                 }
                 g_progress.finish();
             } else {
-                if (!g_opts.output_file.empty()) {
-                    std::cerr << "\r\033[KCollected " << sybil_inputs.size()
-                              << " functions; requesting Sybil embeddings...\n";
+                // Embedding path: stream. Decompilation and HTTP batches are
+                // interleaved by request_sybil_embeddings so the first request
+                // fires after ~one batch instead of after every function has been
+                // decompiled, and the progress bar ticks throughout.
+                std::vector<SybilFunctionInput> sybil_inputs;
+                std::vector<std::string> embeddings;
+                if (!request_sybil_embeddings(export_plan, function_range,
+                                              sybil_inputs, embeddings)) {
+                    return EXIT_FAILURE;
                 }
 
-                std::vector<std::string> embeddings;
-                if (!request_sybil_embeddings(sybil_inputs, embeddings)) {
+                if (sybil_inputs.empty()) {
+                    std::cerr << "Error: No functions available for Sybil embedding request\n";
                     return EXIT_FAILURE;
                 }
 
@@ -3455,8 +3559,8 @@ int main(int argc, char *argv[]) {
                                   << g_opts.output_file << "\n";
                         return EXIT_FAILURE;
                     }
-                    g_progress.finish();
                 }
+                g_progress.finish();
             }
             print_error_report();
             print_modality_size_report();
