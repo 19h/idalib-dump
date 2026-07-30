@@ -31,11 +31,18 @@ endif()
 include(${CMAKE_CURRENT_LIST_DIR}/ida-cmake/bootstrap.cmake)
 find_package(idasdk REQUIRED)
 
+# Shims for SDK entry points missing from older IDA runtimes (see src/sdk_compat.cpp)
+set(SDK_COMPAT_SOURCES "")
+if(NOT WIN32)
+    set(SDK_COMPAT_SOURCES src/sdk_compat.cpp)
+endif()
+
 ida_add_idalib(ida_dump
   TYPE EXECUTABLE
   SOURCES
     src/main.cpp
     src/noplugins.c
+    ${SDK_COMPAT_SOURCES}
     vendor/kat/highlight.c
     vendor/kat/hashtable.c
     vendor/astyle/src/ASBeautifier.cpp
@@ -55,6 +62,8 @@ target_compile_features(ida_dump PRIVATE cxx_std_17)
 # Link psapi for EnumProcessModules (loaded module enumeration)
 if(WIN32)
     target_link_libraries(ida_dump PRIVATE psapi)
+else()
+    target_link_libraries(ida_dump PRIVATE dl)
 endif()
 
 # Bake build info into the binary
@@ -91,6 +100,7 @@ ida_add_idalib(ida_lumina
   SOURCES
     src/lumina.cpp
     src/noplugins.c
+    ${SDK_COMPAT_SOURCES}
   INCLUDES
     ${CMAKE_CURRENT_LIST_DIR}/vendor/kat/include
 )
@@ -109,6 +119,7 @@ ida_add_idalib(ida_lumina_debug
   SOURCES
     src/lumina_debug.cpp
     src/noplugins.c
+    ${SDK_COMPAT_SOURCES}
   INCLUDES
     ${CMAKE_CURRENT_LIST_DIR}/vendor/kat/include
 )
@@ -127,6 +138,7 @@ ida_add_idalib(ida_interr
   SOURCES
     src/interr.cpp
     src/noplugins.c
+    ${SDK_COMPAT_SOURCES}
 )
 
 target_compile_features(ida_interr PRIVATE cxx_std_17)
@@ -156,6 +168,7 @@ if(BUILD_LUMINA_BOT AND NOT WIN32)
           SOURCES
             src/lumina_bot.cpp
             src/noplugins.c
+            ${SDK_COMPAT_SOURCES}
           INCLUDES
             ${CMAKE_CURRENT_LIST_DIR}/vendor/kat/include
         )
