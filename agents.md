@@ -153,7 +153,7 @@ The `CMakeLists.txt` defines three targets via the `ida_add_idalib()` function f
 - Uses `@rpath` for `libidalib.dylib` and `libida.dylib`. `CMAKE_BUILD_RPATH` and `CMAKE_INSTALL_RPATH` are set to `IDA_MACOS_DIR`.
 - Uses `-Wl,-flat_namespace` to work around SDK stub library symbol mismatches (SDK exports `qfree` etc. from `libidalib` stub but runtime has them in `libida`).
 - `make install` performs `codesign --force --sign -` on all binaries.
-- Auto-detects `IDA_MACOS_DIR` from SDK `bin/` tree or `/Applications/IDA Professional 9.3.app/Contents/MacOS`.
+- Auto-detects `IDA_MACOS_DIR`: prefers `/Applications/IDA Professional <SDK major.minor>.app/Contents/MacOS` matching `IDA_SDK_VERSION` in `pro.h`, falls back to the newest installed bundle with a warning, fails at configure time if none is found.
 
 **Windows:**
 - Links `psapi` for `EnumProcessModules` (loaded module enumeration in verbose mode).
