@@ -21,17 +21,58 @@ if(APPLE)
     # Don't skip rpath on macOS - we need it for @rpath references to work
     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
     # Locate the IDA runtime (libida.dylib / libidalib.dylib). Override with
-    # -DIDA_MACOS_DIR=/path/to/IDA.app/Contents/MacOS. Otherwise pick the
-    # newest "IDA Professional*.app" bundle in /Applications.
+    # -DIDA_MACOS_DIR=/path/to/IDA.app/Contents/MacOS. Otherwise prefer the
+    # "IDA Professional <major>.<minor>.app" bundle that matches the SDK we
+    # are building against (so a 9.3 SDK picks 9.3.app even if 9.4 is also
+    # installed), and only fall back to some other bundle with a warning.
     if(NOT IDA_MACOS_DIR)
-        file(GLOB _ida_apps "/Applications/IDA Professional*.app" "$ENV{HOME}/Applications/IDA Professional*.app")
-        list(SORT _ida_apps COMPARE NATURAL ORDER DESCENDING)
-        foreach(_app IN LISTS _ida_apps)
-            if(EXISTS "${_app}/Contents/MacOS/libidalib.dylib")
-                set(IDA_MACOS_DIR "${_app}/Contents/MacOS" CACHE PATH "Path to IDA MacOS directory")
+        set(_ida_app_dirs "/Applications" "$ENV{HOME}/Applications")
+        if(IDA_APP_SEARCH_DIRS)
+            set(_ida_app_dirs ${IDA_APP_SEARCH_DIRS})
+        endif()
+        set(_ida_sdk_ver "")
+        set(_ida_pro_h "$ENV{IDASDK}/include/pro.h")
+        foreach(_cand "$ENV{IDASDK}/include/pro.h" "$ENV{IDASDK}/src/include/pro.h" "$ENV{IDASDK}/sdk/obj/include/pro.h")
+            if(EXISTS "${_cand}")
+                file(STRINGS "${_cand}" _ida_ver_line REGEX "^#define IDA_SDK_VERSION")
+                string(REGEX REPLACE ".*IDA_SDK_VERSION[ \t]+([0-9]+).*" "\\1" _ida_ver_num "${_ida_ver_line}")
+                if(_ida_ver_num MATCHES "^[0-9]+$")
+                    math(EXPR _ida_ver_major "${_ida_ver_num} / 100")
+                    math(EXPR _ida_ver_minor "(${_ida_ver_num} % 100) / 10")
+                    set(_ida_sdk_ver "${_ida_ver_major}.${_ida_ver_minor}")
+                endif()
                 break()
             endif()
         endforeach()
+
+        # 1. Exact match for the SDK version
+        if(_ida_sdk_ver)
+            foreach(_dir IN LISTS _ida_app_dirs)
+                set(_app "${_dir}/IDA Professional ${_ida_sdk_ver}.app/Contents/MacOS")
+                if(EXISTS "${_app}/libidalib.dylib")
+                    set(IDA_MACOS_DIR "${_app}" CACHE PATH "Path to IDA MacOS directory")
+                    break()
+                endif()
+            endforeach()
+        endif()
+
+        # 2. Any installed bundle (newest first), with a warning
+        if(NOT IDA_MACOS_DIR)
+            set(_ida_apps "")
+            foreach(_dir IN LISTS _ida_app_dirs)
+                file(GLOB _found "${_dir}/IDA Professional*.app")
+                list(APPEND _ida_apps ${_found})
+            endforeach()
+            list(SORT _ida_apps COMPARE NATURAL ORDER DESCENDING)
+            foreach(_app IN LISTS _ida_apps)
+                if(EXISTS "${_app}/Contents/MacOS/libidalib.dylib")
+                    set(IDA_MACOS_DIR "${_app}/Contents/MacOS" CACHE PATH "Path to IDA MacOS directory")
+                    message(WARNING "No 'IDA Professional ${_ida_sdk_ver}.app' matching the SDK; using ${_app}. "
+                                    "Pass -DIDA_MACOS_DIR to override.")
+                    break()
+                endif()
+            endforeach()
+        endif()
     endif()
     if(NOT IDA_MACOS_DIR OR NOT EXISTS "${IDA_MACOS_DIR}/libidalib.dylib")
         message(FATAL_ERROR "IDA runtime not found (no libidalib.dylib under '${IDA_MACOS_DIR}'). "
