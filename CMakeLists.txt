@@ -20,8 +20,38 @@ endif()
 if(APPLE)
     # Don't skip rpath on macOS - we need it for @rpath references to work
     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
-    # Default to IDA's MacOS directory
-    set(IDA_MACOS_DIR "/Applications/IDA Professional 9.3.app/Contents/MacOS" CACHE PATH "Path to IDA MacOS directory")
+
+    # Default to the newest installed IDA.app runtime. Linking can succeed
+    # against SDK stubs, but idalib executables must run against the app dylibs.
+    file(GLOB _ida_app_candidates LIST_DIRECTORIES true "/Applications/IDA Professional*.app")
+    set(_ida_macos_default "")
+    set(_ida_macos_version "0")
+    foreach(_ida_app ${_ida_app_candidates})
+        set(_ida_app_macos "${_ida_app}/Contents/MacOS")
+        if(EXISTS "${_ida_app_macos}/libida.dylib" AND EXISTS "${_ida_app_macos}/libidalib.dylib")
+            get_filename_component(_ida_app_name "${_ida_app}" NAME)
+            set(_ida_app_version "0")
+            if(_ida_app_name MATCHES "^IDA Professional ([0-9]+(\\.[0-9]+)*).*\\.app$")
+                set(_ida_app_version "${CMAKE_MATCH_1}")
+            endif()
+
+            if(NOT _ida_macos_default OR _ida_app_version VERSION_GREATER _ida_macos_version)
+                set(_ida_macos_default "${_ida_app_macos}")
+                set(_ida_macos_version "${_ida_app_version}")
+            endif()
+        endif()
+    endforeach()
+    if(NOT _ida_macos_default)
+        set(_ida_macos_default "/Applications/IDA Professional.app/Contents/MacOS")
+    endif()
+
+    set(IDA_MACOS_DIR "${_ida_macos_default}" CACHE PATH "Path to IDA MacOS directory")
+    if(NOT EXISTS "${IDA_MACOS_DIR}/libida.dylib" OR NOT EXISTS "${IDA_MACOS_DIR}/libidalib.dylib")
+        message(FATAL_ERROR
+            "IDA_MACOS_DIR does not contain libida.dylib and libidalib.dylib: ${IDA_MACOS_DIR}\n"
+            "Set -DIDA_MACOS_DIR=/path/to/IDA.app/Contents/MacOS or clear the stale CMake cache.")
+    endif()
+    message(STATUS "Using IDA runtime dir: ${IDA_MACOS_DIR}")
     set(CMAKE_BUILD_RPATH "${IDA_MACOS_DIR}")
     set(CMAKE_INSTALL_RPATH "${IDA_MACOS_DIR}")
 else()
