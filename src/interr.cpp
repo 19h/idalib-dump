@@ -35,6 +35,8 @@
 #include <filesystem>
 #include <limits>
 
+#include "filetype.h"
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -468,67 +470,20 @@ static std::string path_extension_without_dot(const std::filesystem::path& path)
 }
 
 static std::string normalize_file_type(std::string value) {
-    value = to_lower_ascii(value);
-    if (value == "mach" || value == "macho" || value == "mach_o") {
-        return "mach-o";
-    }
-    return value;
+    return ftdetect::normalize_type(std::move(value));
 }
 
 static bool valid_file_type_filter(const std::string& value) {
-    return value == "pe" || value == "elf" || value == "mach-o" || value == "unknown";
+    return ftdetect::is_valid_type(value);
 }
 
 static bool vector_contains(const std::vector<std::string>& values, const std::string& value) {
     return std::find(values.begin(), values.end(), value) != values.end();
 }
 
-// Lightweight magic-byte classification (enough for --type filtering).
+// Magic-byte classification covering IDA's loader set (see src/filetype.h).
 static std::string detect_file_type(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        return "unknown";
-    }
-    // Read a small prefix so 'MZ' can be validated by following e_lfanew to the
-    // real PE signature (a bare 'MZ' alone is just a DOS stub).
-    unsigned char hdr[0x40] = {};
-    file.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
-    const std::streamsize got = file.gcount();
-    if (got < 4) {
-        return "unknown";
-    }
-    const unsigned char* b = hdr;
-
-    if (b[0] == 'M' && b[1] == 'Z') {
-        if (got >= 0x40) {
-            const uint32_t e_lfanew = static_cast<uint32_t>(hdr[0x3c])
-                | (static_cast<uint32_t>(hdr[0x3d]) << 8)
-                | (static_cast<uint32_t>(hdr[0x3e]) << 16)
-                | (static_cast<uint32_t>(hdr[0x3f]) << 24);
-            file.clear();
-            file.seekg(e_lfanew, std::ios::beg);
-            unsigned char sig[4] = {};
-            if (file && file.read(reinterpret_cast<char*>(sig), 4)
-                && sig[0] == 'P' && sig[1] == 'E' && sig[2] == 0 && sig[3] == 0) {
-                return "pe";
-            }
-        }
-        return "unknown";  // DOS stub / NE / LE — not an analyzable PE
-    }
-    if (b[0] == 0x7f && b[1] == 'E' && b[2] == 'L' && b[3] == 'F') {
-        return "elf";
-    }
-
-    const uint32_t le = static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8)
-        | (static_cast<uint32_t>(b[2]) << 16) | (static_cast<uint32_t>(b[3]) << 24);
-    const uint32_t be = (static_cast<uint32_t>(b[0]) << 24) | (static_cast<uint32_t>(b[1]) << 16)
-        | (static_cast<uint32_t>(b[2]) << 8) | static_cast<uint32_t>(b[3]);
-    if (le == 0xfeedface || le == 0xfeedfacf || le == 0xcefaedfe || le == 0xcffaedfe
-        || be == 0xcafebabe || be == 0xcafebabf) {
-        return "mach-o";
-    }
-
-    return "unknown";
+    return ftdetect::detect_type(path);
 }
 
 static bool has_active_input_filters() {
@@ -1131,7 +1086,8 @@ static void print_usage(const char* prog) {
     std::cout << "  -r, --recursive      Recursively process all files under <input_path>\n";
     std::cout << "  -j, --jobs <count>   Worker processes for --recursive (default: CPU count)\n";
     std::cout << "  --ext <ext>          Only process files with extension (repeatable, e.g. dll)\n";
-    std::cout << "  --type <type>        Only process binary type: pe, elf, mach-o, unknown (repeatable)\n";
+    std::cout << "  --type <type>        Only process this detected binary type (repeatable):\n";
+    std::cout << "                       " << ftdetect::types_help_text("                       ") << "\n";
     std::cout << "  -q, --quiet          Suppress IDA's verbose messages\n";
     std::cout << "  --no-color           Disable colored output\n";
     std::cout << "  --no-plugins         Don't load user plugins (keeps IDA built-in plugins)\n";
@@ -1207,7 +1163,8 @@ static bool parse_args(int argc, char* argv[]) {
             }
             std::string file_type = normalize_file_type(argv[++i]);
             if (!valid_file_type_filter(file_type)) {
-                std::cerr << "Error: --type expects one of: pe, elf, mach-o, unknown\n";
+                std::cerr << "Error: --type expects one of:\n  "
+                          << ftdetect::types_help_text("  ") << "\n";
                 return false;
             }
             if (!vector_contains(g_opts.file_types, file_type)) {

@@ -26,6 +26,8 @@
 #include <filesystem>
 #include <limits>
 
+#include "filetype.h"
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -613,15 +615,11 @@ static std::string path_extension_without_dot(const std::filesystem::path& path)
 }
 
 static std::string normalize_file_type(std::string value) {
-    value = to_lower_ascii(value);
-    if (value == "mach" || value == "macho" || value == "mach_o") {
-        return "mach-o";
-    }
-    return value;
+    return ftdetect::normalize_type(std::move(value));
 }
 
 static bool valid_file_type_filter(const std::string& value) {
-    return value == "pe" || value == "elf" || value == "mach-o" || value == "unknown";
+    return ftdetect::is_valid_type(value);
 }
 
 static bool read_file_range(const std::filesystem::path& path, uint64_t offset, size_t size, std::vector<uint8_t>& out) {
@@ -952,28 +950,23 @@ static bool detect_macho_debug_info(const std::filesystem::path& path) {
 
 static FileInspection inspect_file(const std::string& input_file) {
     const std::filesystem::path path(input_file);
-    std::vector<uint8_t> prefix;
     FileInspection inspection;
+    inspection.type = ftdetect::detect_type(path);
+
+    // Debug-info probing only knows the three formats that commonly carry it;
+    // every other recognized type reports has_debug = false.
+    std::vector<uint8_t> prefix;
     if (!read_file_range(path, 0, 4096, prefix) || prefix.size() < 4) {
         return inspection;
     }
-
-    if (prefix[0] == 'M' && prefix[1] == 'Z' && has_pe_signature(path, prefix)) {
-        inspection.type = "pe";
+    if (inspection.type == "pe") {
         inspection.has_debug = detect_pe_debug_info(path, prefix);
     }
-    else if (prefix[0] == 0x7f && prefix[1] == 'E' && prefix[2] == 'L' && prefix[3] == 'F') {
-        inspection.type = "elf";
+    else if (inspection.type == "elf") {
         inspection.has_debug = detect_elf_debug_info(path, prefix);
     }
-    else {
-        const uint32_t magic = read_u32(prefix, 0, true);
-        const uint32_t magic_be = read_u32(prefix, 0, false);
-        if (magic == 0xfeedface || magic == 0xfeedfacf || magic == 0xcefaedfe || magic == 0xcffaedfe
-            || magic_be == 0xcafebabe || magic_be == 0xcafebabf) {
-            inspection.type = "mach-o";
-            inspection.has_debug = detect_macho_debug_info(path);
-        }
+    else if (inspection.type == "mach-o") {
+        inspection.has_debug = detect_macho_debug_info(path);
     }
 
     return inspection;
@@ -1388,7 +1381,8 @@ static void print_usage(const char* prog) {
     std::cout << "  -v, --verbose        Show extra debug output\n";
     std::cout << "  -j, --jobs <count>   Worker processes for --recursive (default: CPU count)\n";
     std::cout << "  --ext <ext>          Only process files with extension (repeatable, e.g. dll)\n";
-    std::cout << "  --type <type>        Only process binary type: pe, elf, mach-o, unknown (repeatable)\n";
+    std::cout << "  --type <type>        Only process this detected binary type (repeatable):\n";
+    std::cout << "                       " << ftdetect::types_help_text("                       ") << "\n";
     std::cout << "  --require-debug      Only process files with debug info; PE also accepts an adjacent PDB\n";
     std::cout << "  --no-color           Disable colored output\n";
     std::cout << "  --no-plugins         Don't load user plugins (except Hex-Rays)\n";
@@ -1466,7 +1460,8 @@ static bool parse_args(int argc, char* argv[]) {
             }
             std::string file_type = normalize_file_type(argv[++i]);
             if (!valid_file_type_filter(file_type)) {
-                std::cerr << "Error: --type expects one of: pe, elf, mach-o, unknown\n";
+                std::cerr << "Error: --type expects one of:\n  "
+                          << ftdetect::types_help_text("  ") << "\n";
                 return false;
             }
             if (!vector_contains(g_opts.file_types, file_type)) {

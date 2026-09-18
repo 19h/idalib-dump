@@ -200,7 +200,7 @@ or any worker crashes, so it can gate a CI run.
 | `-r, --recursive` | Recursively process all files under `<input_path>` |
 | `-j, --jobs <count>` | Worker processes for `--recursive` (defaults to CPU count) |
 | `--ext <ext>` | Only process files with this extension; repeatable, accepts `dll` or `.dll` |
-| `--type <type>` | Only process detected binary type; repeatable: `pe`, `elf`, `mach-o`, `unknown` |
+| `--type <type>` | Only process detected binary type; repeatable, see [Binary types](#binary-types) |
 | `-q, --quiet` | Suppress IDA's verbose messages |
 | `--no-color` | Disable colored output |
 | `--no-plugins` | Don't load user plugins (Hex-Rays still loads) |
@@ -247,7 +247,7 @@ Analyzes a binary and pushes all function metadata to the Hex-Rays Lumina server
 | `-v, --verbose` | Show extra debug output |
 | `-j, --jobs <count>` | Worker processes for `--recursive` (defaults to CPU count) |
 | `--ext <ext>` | Only process files with this extension; repeatable, accepts `dll` or `.dll` |
-| `--type <type>` | Only process detected binary type; repeatable, supports `pe`, `elf`, `mach-o`, `unknown` |
+| `--type <type>` | Only process detected binary type; repeatable, see [Binary types](#binary-types) |
 | `--require-debug` | Only process files with debug info; PE files also match when a same-basename `.pdb` is present |
 | `--no-color` | Disable colored output |
 | `--no-plugins` | Don't load user plugins (Hex-Rays still loads) |
@@ -339,6 +339,67 @@ ida_lumina_debug -F "main,parse_config,0x140001000" program.exe
 ```
 
 **Note**: Recursive mode is Unix-only because it uses `fork()` workers to avoid sharing single-threaded `idalib` state.
+
+
+## Binary types
+
+`--type` classifies each input by magic bytes before any worker starts, so a
+corpus can be narrowed without paying for analysis. The slugs track the loaders
+shipped in `ida/ldr` and `ida/sdk/src/ldr`, and the checks in `src/filetype.h`
+mirror each loader's `accept_file()` magic test.
+
+| Slug | Format | Magic |
+|------|--------|-------|
+| `pe` | Portable Executable | `MZ` → `PE\0\0` |
+| `ne` | New Executable | `MZ` → `NE` |
+| `lx` / `le` | Linear Executable | `MZ` → `LX` / `LE` |
+| `w32run` | Watcom DOS/32 extender | `MZ` → `CF` |
+| `exe` | Plain MS-DOS `MZ` | `MZ` with no extended header |
+| `elf` | ELF | `\x7fELF` |
+| `mach-o` | Mach-O, thin or fat | `feedface`/`feedfacf`/`cafebabe` |
+| `dsc` | dyld shared cache | `dyld_v` |
+| `coff` | COFF / XCOFF / ECOFF | machine id + sane file header |
+| `xex` | Xbox 360 executable | `XEX2`/`XEX1`/`XEX0`/`XEX%`/`XEX-`/`XEX?` |
+| `xbe` | Original Xbox executable | `XBEH` (and the `XE` variant) |
+| `psx` / `psxobj` | PlayStation image / object | `PS-X EXE`, `SCE EXE` / `LNK\x02`, `LIB` |
+| `n64` | Nintendo 64 ROM | `80371240` and byte-swapped dumps |
+| `spc` | SNES SPC700 dump | `SNES-SPC700 Sound File Data` |
+| `prc` | Palm resource database | resource-map validation |
+| `epoc` | Symbian E32/ROM/SIS | `EPOC` signature or EPOC UIDs |
+| `geos` | GEOS executable | `53CF45C7` / `53C145C7` |
+| `dex` / `vdex` | Android bytecode | `dex\n`/`dey\n` / `vdex`, `cdex` |
+| `java` | JVM class file | `cafebabe` + class version |
+| `wasm` | WebAssembly module | `\0asm` + version 1 |
+| `aout` | Unix a.out | `a_midmag` magic word |
+| `aif` / `aof` | ARM image / object | zero-init code / `C3CBC6C5` |
+| `amiga` | Amiga hunk | `000003F3` |
+| `pef` | PEF (Mac OS / BeOS) | `Joy!peff` |
+| `hpsom` | HP-UX SOM | system id + `a_magic` |
+| `nlm` | NetWare Loadable Module | `NetWare Loadable Module\x1a` |
+| `os9` / `osk` | OS-9/6809 / OS-9/68K | `87CD` / `4AFC` |
+| `omf` / `intelomf` | OMF record / Intel OMF386 | `0x80`, `0xF0` / `0xB0` |
+| `mas` / `is5x` | Alfred Arnold AS / Intel 51 | `1489` / `C9B8` |
+| `tmobj` | TMObj module | `3C46F37A` |
+| `ar` / `aixar` | ar / AIX ar archive | `!<arch>` etc. / `<aiaff>`, `<bigaf>` |
+| `zip` / `tar` | Archives | `PK\x03\x04` / `ustar` at 257 |
+| `uimage` / `bflt` / `md1img` | U-Boot / uClinux / MediaTek | `27051956` / `bFLT` / `58881688` |
+| `pdf` | PDF | `%PDF` |
+| `windmp` | Windows crash dump | `MDMP`, `PAGEDUMP`, `PAGEDU64` |
+| `ihex` / `mhex` / `srec` | Textual ROM images | leading `:` / `;` / `S` |
+| `unknown` | Everything else | — |
+
+Common spellings are accepted as aliases (`macho`, `xbox360`, `dos`, `minidump`,
+`hex`, `palm`, …).
+
+Some loaders recognize their input by scanning its content rather than by a
+magic number, so files they would accept stay `unknown`: `autoproc`, `bochsrc`,
+`dump`, `exp` (Phar Lap), `hexagon_mbn`, `omf166`, `qnx`, `rt11`, `sbn`, `snes`,
+and the scripted loaders that search for code patterns (`bios_image`,
+`clemency`, `cortex_m`, `dsp_lod`, `esp`, `gas_d`, `wince`). Pass those files
+explicitly, or filter them with `--ext` instead.
+
+Recognizing a type is not the same as IDA being able to load it: `xex`, for
+instance, needs a third-party loader such as `idaxex` in `~/.idapro/loaders`.
 
 ## Output Format
 
