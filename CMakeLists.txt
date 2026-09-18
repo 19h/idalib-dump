@@ -20,8 +20,24 @@ endif()
 if(APPLE)
     # Don't skip rpath on macOS - we need it for @rpath references to work
     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
-    # Default to IDA's MacOS directory
-    set(IDA_MACOS_DIR "/Applications/IDA Professional 9.3.app/Contents/MacOS" CACHE PATH "Path to IDA MacOS directory")
+    # Locate the IDA runtime (libida.dylib / libidalib.dylib). Override with
+    # -DIDA_MACOS_DIR=/path/to/IDA.app/Contents/MacOS. Otherwise pick the
+    # newest "IDA Professional*.app" bundle in /Applications.
+    if(NOT IDA_MACOS_DIR)
+        file(GLOB _ida_apps "/Applications/IDA Professional*.app" "$ENV{HOME}/Applications/IDA Professional*.app")
+        list(SORT _ida_apps COMPARE NATURAL ORDER DESCENDING)
+        foreach(_app IN LISTS _ida_apps)
+            if(EXISTS "${_app}/Contents/MacOS/libidalib.dylib")
+                set(IDA_MACOS_DIR "${_app}/Contents/MacOS" CACHE PATH "Path to IDA MacOS directory")
+                break()
+            endif()
+        endforeach()
+    endif()
+    if(NOT IDA_MACOS_DIR OR NOT EXISTS "${IDA_MACOS_DIR}/libidalib.dylib")
+        message(FATAL_ERROR "IDA runtime not found (no libidalib.dylib under '${IDA_MACOS_DIR}'). "
+                            "Pass -DIDA_MACOS_DIR=\"/Applications/IDA Professional 9.x.app/Contents/MacOS\"")
+    endif()
+    message(STATUS "Using IDA runtime dir: ${IDA_MACOS_DIR}")
     set(CMAKE_BUILD_RPATH "${IDA_MACOS_DIR}")
     set(CMAKE_INSTALL_RPATH "${IDA_MACOS_DIR}")
 else()
