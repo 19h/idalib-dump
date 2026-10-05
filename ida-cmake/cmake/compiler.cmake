@@ -16,6 +16,7 @@ add_library(ida_compiler_settings INTERFACE)
 target_compile_definitions(ida_compiler_settings INTERFACE
     __IDP__
     __EA64__=1  # Always use EA64 (64-bit addressing)
+    $<$<CXX_COMPILER_ID:MSVC>:NOMINMAX>
     $<$<CONFIG:Debug>:_DEBUG>
     $<$<CONFIG:Release>:NDEBUG>
 )

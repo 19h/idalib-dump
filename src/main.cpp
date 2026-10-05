@@ -68,6 +68,7 @@ static inline int real_fprintf(FILE* stream, const char* fmt, ...) {
 #include <fcntl.h>
 #include <process.h>
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <psapi.h>
 // Windows equivalents - use inline functions to avoid macro conflicts with std library
