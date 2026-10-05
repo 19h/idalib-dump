@@ -125,6 +125,7 @@ extern "C" {
 #include <name.hpp>
 #include <loader.hpp>
 #include <hexrays.hpp>
+#include "hexrays_handshake.hpp"
 #include <idalib.hpp>
 #include <segment.hpp>
 #include <typeinf.hpp>
@@ -3023,7 +3024,7 @@ public:
             std::cout << "[*] Analysis complete." << std::endl;
         }
 
-        if (init_hexrays_plugin()) {
+        if (idalib::hexrays::handshake()) {
             g_hexrays_available = true;
         } else {
             g_hexrays_available = false;

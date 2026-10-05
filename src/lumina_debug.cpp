@@ -98,6 +98,7 @@ extern "C" bool g_block_plugins;
 #include <name.hpp>
 #include <loader.hpp>
 #include <hexrays.hpp>
+#include "hexrays_handshake.hpp"
 #include <idalib.hpp>
 #include <segment.hpp>
 #include <typeinf.hpp>
@@ -1090,7 +1091,7 @@ public:
         if (!quiet_mode)
             std::cerr << "[*] Analysis complete." << std::endl;
 
-        if (init_hexrays_plugin())
+        if (idalib::hexrays::handshake())
             m_hexrays_available = true;
     }
 

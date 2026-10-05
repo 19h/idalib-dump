@@ -183,3 +183,8 @@ if(BUILD_LUMINA_BOT AND NOT WIN32)
 elseif(BUILD_LUMINA_BOT AND WIN32)
     message(STATUS "Skipping lumina_bot on Windows (TDLib not supported)")
 endif()
+
+# Decisions in the 9.4/9.5 decompiler shim. No IDA linkage.
+add_executable(hexrays_abi_tests tests/hexrays_abi_tests.cpp)
+target_include_directories(hexrays_abi_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
+target_compile_features(hexrays_abi_tests PRIVATE cxx_std_17)
