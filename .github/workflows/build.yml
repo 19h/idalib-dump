@@ -103,7 +103,7 @@ jobs:
         run: |
           mkdir build -Force
           cd build
-          cmake .. -G "Visual Studio 17 2022" -A ${{ matrix.cmake_arch }} -DIDASDK_VER=92
+          cmake .. -G "Visual Studio 18 2026" -A ${{ matrix.cmake_arch }} -DIDASDK_VER=92
         env:
           IDASDK: ${{ github.workspace }}/ida-sdk
 
